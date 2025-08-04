@@ -3,11 +3,10 @@ import os
 from openai import OpenAI
 from typing import List, Dict
 from sklearn.metrics.pairwise import cosine_similarity
-
-# Load API key from .env or environment
 from dotenv import load_dotenv
-load_dotenv()
 
+# Load environment variables
+load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def load_resume(file_path: str) -> List[Dict]:
@@ -24,7 +23,7 @@ def get_embedding(text: str) -> List[float]:
 def embed_resume_sections(resume: List[Dict]) -> Dict[str, List[float]]:
     embeddings = {}
     for section in resume:
-        if section["type"] == "experience":
+        if section["type"] == "experience" or section["type"] in ["summary", "skills"]:
             combined_text = section.get("summary", "")
             for contrib in section.get("contributions", []):
                 combined_text += " " + contrib["description"]
@@ -59,14 +58,20 @@ def generate_tailored_resume(
     use_embeddings=False will use offline keyword scoring.
     """
 
-    # --- Step 1: Rank by chosen scoring method ---
+    # Separate sections
+    header = next((sec for sec in resume if sec["type"] == "header"), None)
+    fixed_top = [sec for sec in resume if sec["type"] in ["summary", "skills"] or sec["id"].startswith("tech_")]
+    experience_sections = [sec for sec in resume if sec["type"] == "experience"]
+    fixed_bottom = [sec for sec in resume if sec["type"] in ["education", "certifications", "projects", "awards"]]
+
+    # Step 1: Rank experience by chosen scoring method
     if use_embeddings:
-        ranked_experience = rank_by_embedding(resume, job_description)
+        ranked_experience = rank_by_embedding(experience_sections, job_description)
     else:
         from resume_scoring_engine import rank_resume_sections
-        ranked_experience = rank_resume_sections(resume, job_description)
+        ranked_experience = rank_resume_sections(experience_sections, job_description)
 
-    # --- Step 2: Apply ordering preference ---
+    # Step 2: Apply ordering preference to experience only
     if ordering == "relevancy":
         ordered_experience = ranked_experience
 
@@ -78,14 +83,14 @@ def generate_tailored_resume(
             except:
                 return 0
         ordered_experience = sorted(
-            [sec for sec in resume if sec["type"] == "experience"],
+            experience_sections,
             key=lambda s: parse_start_year(s.get("dates", "")),
             reverse=True
         )
 
     elif ordering == "hybrid":
         top_relevant = ranked_experience[:top_n]
-        remaining = [sec for sec in resume if sec["type"] == "experience" and sec not in top_relevant]
+        remaining = [sec for sec in experience_sections if sec not in top_relevant]
 
         def parse_start_year(date_str):
             parts = date_str.split("–")[0].strip()
@@ -93,15 +98,25 @@ def generate_tailored_resume(
                 return int(parts.split()[-1])
             except:
                 return 0
-        remaining_sorted = sorted(remaining, key=lambda s: parse_start_year(s.get("dates", "")), reverse=True)
+        remaining_sorted = sorted(
+            remaining,
+            key=lambda s: parse_start_year(s.get("dates", "")),
+            reverse=True
+        )
 
         ordered_experience = top_relevant + remaining_sorted
 
     else:
-        ordered_experience = ranked_experience  # default fallback
+        ordered_experience = ranked_experience
 
-    # --- Step 3: Build final tailored resume ---
-    tailored = [sec for sec in resume if sec["type"] in ["summary", "skills"]]
+    # Step 3: Assemble resume
+    tailored = []
+    if header:
+        tailored.append(header)
+
+    tailored.extend(fixed_top)
     tailored.extend(ordered_experience)
+    tailored.extend(fixed_bottom)
+
     return tailored
 

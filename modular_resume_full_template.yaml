@@ -1,24 +1,69 @@
+# ===== HEADER / CONTACT / BRANDING =====
+- id: header
+  type: header
+  name: Your Name
+  title: Target Role or Branding Statement (e.g., Senior Software Engineering Manager | Cloud Platforms | DevOps | SaaS)
+  location: City, State
+  phone: (XXX) XXX-XXXX
+  email: you@example.com
+  linkedin: linkedin.com/in/yourprofile
+  github: github.com/yourusername
+  portfolio: yourportfolio.com
+
+# ===== EXECUTIVE SUMMARY =====
 - id: summary
   type: summary
   title: Executive Summary
   tags: []
   summary: >
-    Your professional summary goes here.
+    Concise 3–4 sentence professional summary highlighting your years of experience,
+    top skills, and measurable achievements relevant to your target role.
 
+# ===== CORE COMPETENCIES =====
 - id: core_competencies
   type: skills
   title: Core Competencies
   tags: []
   summary: >
-    List your main skill areas.
+    High-level strengths and focus areas (e.g., Leadership, Strategic Planning, Cloud Architecture, Process Improvement).
 
-- id: tech_stack
+# ===== TECHNICAL PROFICIENCIES =====
+- id: tech_languages_frameworks
   type: skills
-  title: Technical Proficiencies
+  title: Languages & Frameworks
   tags: []
   summary: >
-    List your technologies here.
+    Example: Python, JavaScript, TypeScript, Java, C#, .NET Core, Node.js, React, Angular, Django, Spring Boot
 
+- id: tech_cloud_infrastructure
+  type: skills
+  title: Cloud & Infrastructure
+  tags: []
+  summary: >
+    Example: AWS (EC2, RDS, Lambda, S3, CloudFormation), GCP, Azure, Kubernetes, Docker, Terraform
+
+- id: tech_devops_tooling
+  type: skills
+  title: DevOps & Tooling
+  tags: []
+  summary: >
+    Example: Jenkins, GitLab CI/CD, GitHub Actions, n8n, Backstage, Ansible, New Relic, Graylog, Metabase
+
+- id: tech_databases
+  type: skills
+  title: Databases
+  tags: []
+  summary: >
+    Example: MySQL, PostgreSQL, Oracle, SQL Server, MongoDB, Redis
+
+- id: tech_security_compliance
+  type: skills
+  title: Security & Compliance
+  tags: []
+  summary: >
+    Example: PCI-DSS, SOC 2, GDPR, Secure SDLC, Risk Mitigation, Incident Response
+
+# ===== EXPERIENCE =====
 - id: exp01
   type: experience
   title: Job Title
@@ -27,7 +72,61 @@
   dates: YYYY – YYYY
   tags: []
   summary: >
-    Brief description of your role.
+    Brief one-line description of your role and scope.
+  contributions:
+    - description: Accomplished X by implementing Y, resulting in Z (quantifiable metric).
+      skills_used: [Skill1, Skill2]
+
+- id: exp02
+  type: experience
+  title: Job Title
+  company: Company Name
+  location: City, State
+  dates: YYYY – YYYY
+  tags: []
+  summary: >
+    Brief one-line description of your role and scope.
   contributions:
     - description: Example contribution.
       skills_used: [Skill1, Skill2]
+
+# ===== EDUCATION =====
+- id: education
+  type: education
+  title: Education
+  entries:
+    - degree: Bachelor of Science in Computer Science
+      institution: University Name
+      graduation_year: YYYY
+    - degree: Master of Science in Software Engineering
+      institution: University Name
+      graduation_year: YYYY
+
+# ===== CERTIFICATIONS =====
+- id: certifications
+  type: certifications
+  title: Certifications
+  entries:
+    - name: AWS Certified Solutions Architect – Professional
+      year: YYYY
+    - name: Certified Kubernetes Administrator (CKA)
+      year: YYYY
+
+# ===== PROJECTS / HIGHLIGHTS =====
+- id: projects
+  type: projects
+  title: Projects & Leadership Highlights
+  entries:
+    - name: Project Name
+      description: Brief description of project, technologies used, and impact.
+    - name: Project Name
+      description: Another example project or leadership initiative.
+
+# ===== AWARDS =====
+- id: awards
+  type: awards
+  title: Awards & Recognition
+  entries:
+    - name: Award Name
+      year: YYYY
+      description: Reason for award or recognition.
