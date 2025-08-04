@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{{ name }} - Tailored Resume</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        h1, h2 { color: #333; }
+        .section { margin-bottom: 30px; }
+        .contribution { margin-left: 20px; }
+        ul { margin-top: 0; }
+    </style>
+</head>
+<body>
+    <h1>{{ name }}</h1>
+    <p>{{ contact }}</p>
+    <h2>Executive Summary</h2>
+    <p>{{ tailored_summary }}</p>
+
+    {% for section in resume %}
+        <div class="section">
+            {% if section.type == 'summary' %}
+                <h2>Executive Summary</h2>
+                <p>{{ section.summary }}</p>
+            {% elif section.type == 'skills' %}
+                <h2>Core Competencies</h2>
+                <p>{{ section.summary }}</p>
+            {% elif section.type == 'experience' %}
+                <h2>{{ section.title }} — {{ section.company }}</h2>
+                <p><em>{{ section.location }} | {{ section.dates }}</em></p>
+                <p>{{ section.summary }}</p>
+                <ul>
+                    {% for contrib in section.contributions %}
+                        <li class="contribution">{{ contrib.description }}</li>
+                    {% endfor %}
+                </ul>
+            {% endif %}
+        </div>
+    {% endfor %}
+</body>
+</html>

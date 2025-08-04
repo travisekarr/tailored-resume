@@ -1,0 +1,33 @@
+- id: summary
+  type: summary
+  title: Executive Summary
+  tags: []
+  summary: >
+    Your professional summary goes here.
+
+- id: core_competencies
+  type: skills
+  title: Core Competencies
+  tags: []
+  summary: >
+    List your main skill areas.
+
+- id: tech_stack
+  type: skills
+  title: Technical Proficiencies
+  tags: []
+  summary: >
+    List your technologies here.
+
+- id: exp01
+  type: experience
+  title: Job Title
+  company: Company Name
+  location: City, State
+  dates: YYYY – YYYY
+  tags: []
+  summary: >
+    Brief description of your role.
+  contributions:
+    - description: Example contribution.
+      skills_used: [Skill1, Skill2]
