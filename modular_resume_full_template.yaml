@@ -3,6 +3,7 @@
   type: header
   name: Your Name
   title: Target Role or Branding Statement (e.g., Senior Software Engineering Manager | Cloud Platforms | DevOps | SaaS)
+  years_experience: 15
   location: City, State
   phone: (XXX) XXX-XXXX
   email: you@example.com
@@ -13,11 +14,17 @@
 # ===== EXECUTIVE SUMMARY =====
 - id: summary
   type: summary
-  title: Executive Summary
+  title: Professional Overview
   tags: []
   summary: >
     Concise 3–4 sentence professional summary highlighting your years of experience,
     top skills, and measurable achievements relevant to your target role.
+  achievements:
+    - "Led a cross-functional DevOps transformation that reduced deployment times by 60%."
+    - "Delivered a $3M cost savings through cloud infrastructure optimization."
+    - "Increased platform uptime to 99.99% by implementing proactive monitoring and alerting."
+    - "Directed a 15-person engineering team delivering 12 successful product launches in 18 months."
+    - "Cut cloud costs by 40% while improving system performance through resource optimization."
 
 # ===== CORE COMPETENCIES =====
 - id: core_competencies
