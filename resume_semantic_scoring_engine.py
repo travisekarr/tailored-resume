@@ -1,122 +1,239 @@
 import yaml
 import os
-from openai import OpenAI
-from typing import List, Dict
+import json
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Embeddings cache file
+CACHE_FILE = "embeddings_cache.json"
 
-def load_resume(file_path: str) -> List[Dict]:
-    with open(file_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
 
-def get_embedding(text: str) -> List[float]:
-    response = client.embeddings.create(
-        input=[text],
-        model="text-embedding-3-small"
-    )
-    return response.data[0].embedding
+# =====================
+# YAML LOAD
+# =====================
+def load_resume(file_path):
+    """Load the YAML resume as a list of sections."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        resume_sections = yaml.safe_load(f)
+    if not isinstance(resume_sections, list):
+        raise ValueError("Resume YAML must be a list of sections")
+    return resume_sections
 
-def embed_resume_sections(resume: List[Dict]) -> Dict[str, List[float]]:
-    embeddings = {}
-    for section in resume:
-        if section["type"] == "experience" or section["type"] in ["summary", "skills"]:
-            combined_text = section.get("summary", "")
-            for contrib in section.get("contributions", []):
-                combined_text += " " + contrib["description"]
-            embeddings[section["id"]] = get_embedding(combined_text)
-    return embeddings
 
-def rank_by_embedding(resume: List[Dict], job_description: str) -> List[Dict]:
-    job_embedding = get_embedding(job_description)
-    resume_embeddings = embed_resume_sections(resume)
+# =====================
+# TEXT BUILDING
+# =====================
+def _safe_list(x):
+    return x if isinstance(x, (list, tuple)) else []
 
-    scores = []
-    for section_id, embedding in resume_embeddings.items():
-        score = cosine_similarity([embedding], [job_embedding])[0][0]
-        for section in resume:
-            if section["id"] == section_id:
-                scores.append((score, section))
-                break
+def _safe_dict_list(x):
+    """Ensure we only iterate dict-like entries; coerce non-dicts to empty."""
+    lst = _safe_list(x)
+    return [e for e in lst if isinstance(e, dict)]
 
-    scores.sort(reverse=True, key=lambda x: x[0])
-    return [section for score, section in scores]
+def section_text(section):
+    """
+    Build a searchable string from a section, including tags and skills_used.
+    Nil-safe for missing/None fields (entries, contributions, tags, summary).
+    """
+    if not isinstance(section, dict):
+        return ""
 
+    text_parts = []
+
+    # Summary
+    summary = section.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        text_parts.append(summary.strip())
+
+    # Tags
+    tags = _safe_list(section.get("tags"))
+    text_parts.extend(str(t).strip() for t in tags if t)
+
+    # Experience -> contributions + skills_used
+    if section.get("type") == "experience":
+        for contrib in _safe_dict_list(section.get("contributions")):
+            desc = contrib.get("description")
+            if isinstance(desc, str) and desc.strip():
+                text_parts.append(desc.strip())
+            skills_used = _safe_list(contrib.get("skills_used"))
+            text_parts.extend(str(s).strip() for s in skills_used if s)
+    else:
+        # Other sections -> flatten entries values
+        for entry in _safe_dict_list(section.get("entries")):
+            for value in entry.values():
+                if value is None:
+                    continue
+                text_parts.append(str(value).strip())
+
+    # Join safely
+    return " ".join([t for t in text_parts if t])
+
+
+# =====================
+# CACHE MANAGEMENT
+# =====================
+def _load_cache():
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_cache(cache):
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f)
+
+
+def clear_embeddings_cache():
+    """Delete the embeddings cache file."""
+    if os.path.exists(CACHE_FILE):
+        os.remove(CACHE_FILE)
+
+
+# =====================
+# OPENAI EMBEDDINGS
+# =====================
+def get_embedding(text, model="text-embedding-3-small"):
+    """Get embedding from OpenAI with caching."""
+    from openai import OpenAI
+    client = OpenAI()
+
+    cache = _load_cache()
+    key = f"{model}:{text.strip()}"
+    if key in cache:
+        return cache[key]
+
+    emb = client.embeddings.create(input=[text], model=model).data[0].embedding
+    cache[key] = emb
+    _save_cache(cache)
+    return emb
+
+
+def rank_by_embedding(resume, job_description, model="text-embedding-3-small"):
+    """Rank sections by semantic similarity using OpenAI embeddings."""
+    job_embedding = get_embedding(job_description, model=model)
+    section_scores = []
+    for sec in resume:
+        emb = get_embedding(section_text(sec), model=model)
+        score = cosine_similarity([job_embedding], [emb])[0][0]
+        section_scores.append((sec, score))
+
+    section_scores.sort(key=lambda x: x[1], reverse=True)
+    scores_dict = {id(sec): score for sec, score in section_scores}
+    ranked_sections = [sec for sec, _ in section_scores]
+    return ranked_sections, scores_dict
+
+
+# =====================
+# TF-IDF RANKING
+# =====================
+def rank_resume_sections(resume, job_description):
+    """Rank sections by keyword-based TF-IDF similarity."""
+    corpus = [job_description] + [section_text(sec) for sec in resume]
+    tfidf = TfidfVectorizer().fit_transform(corpus)
+    cosine_similarities = cosine_similarity(tfidf[0:1], tfidf[1:]).flatten()
+    ranked_indices = cosine_similarities.argsort()[::-1]
+    ranked_sections = [resume[i] for i in ranked_indices]
+    scores_dict = {id(resume[i]): float(cosine_similarities[i]) for i in range(len(resume))}
+    return ranked_sections, scores_dict
+
+
+# =====================
+# MAIN GENERATOR
+# =====================
 def generate_tailored_resume(
     resume,
     job_description,
-    top_n=3,
+    top_n=None,
     use_embeddings=False,
-    ordering="relevancy"
+    ordering="relevancy",
+    embedding_model="text-embedding-3-small"
 ):
     """
-    Generate a tailored resume with flexible ordering.
-    ordering options: 'relevancy', 'chronological', 'hybrid'
-    use_embeddings=False will use offline keyword scoring.
+    Generate a tailored resume based on ordering preference.
+    Returns: (list of sections, scores_dict)
     """
+    if ordering == "chronological":
+        return [sec for sec in resume if sec["type"] != "header"], {}
 
-    # Separate sections
-    header = next((sec for sec in resume if sec["type"] == "header"), None)
-    fixed_top = [sec for sec in resume if sec["type"] in ["summary", "skills"] or sec["id"].startswith("tech_")]
-    experience_sections = [sec for sec in resume if sec["type"] == "experience"]
-    fixed_bottom = [sec for sec in resume if sec["type"] in ["education", "certifications", "projects", "awards"]]
-
-    # Step 1: Rank experience by chosen scoring method
     if use_embeddings:
-        ranked_experience = rank_by_embedding(experience_sections, job_description)
+        ranked_sections, scores = rank_by_embedding(resume, job_description, model=embedding_model)
     else:
-        from resume_scoring_engine import rank_resume_sections
-        ranked_experience = rank_resume_sections(experience_sections, job_description)
+        ranked_sections, scores = rank_resume_sections(resume, job_description)
 
-    # Step 2: Apply ordering preference to experience only
     if ordering == "relevancy":
-        ordered_experience = ranked_experience
+        return (ranked_sections[:top_n] if top_n else ranked_sections), scores
 
-    elif ordering == "chronological":
-        def parse_start_year(date_str):
-            parts = date_str.split("–")[0].strip()
-            try:
-                return int(parts.split()[-1])
-            except:
-                return 0
-        ordered_experience = sorted(
-            experience_sections,
-            key=lambda s: parse_start_year(s.get("dates", "")),
-            reverse=True
-        )
+    if ordering == "hybrid":
+        top_relevant = ranked_sections[:top_n]
+        remaining = [sec for sec in resume if sec not in top_relevant and sec["type"] != "header"]
+        return top_relevant + remaining, scores
 
-    elif ordering == "hybrid":
-        top_relevant = ranked_experience[:top_n]
-        remaining = [sec for sec in experience_sections if sec not in top_relevant]
+    return resume, scores
 
-        def parse_start_year(date_str):
-            parts = date_str.split("–")[0].strip()
-            try:
-                return int(parts.split()[-1])
-            except:
-                return 0
-        remaining_sorted = sorted(
-            remaining,
-            key=lambda s: parse_start_year(s.get("dates", "")),
-            reverse=True
-        )
 
-        ordered_experience = top_relevant + remaining_sorted
+# =====================
+# IMPACT BULLET GENERATION
+# =====================
+def enhance_experience_with_impact(
+    resume,
+    job_description,
+    use_gpt=False,
+    model="gpt-3.5-turbo",
+    mark_generated=True,
+    bullets_per_role=1
+):
+    """
+    Append impact bullets to each experience section.
+    Adds metadata: impact: True, source: generated
+    """
+    if not use_gpt or bullets_per_role < 1:
+        return resume
 
-    else:
-        ordered_experience = ranked_experience
+    from openai import OpenAI
+    client = OpenAI()
 
-    # Step 3: Assemble resume
-    tailored = []
-    if header:
-        tailored.append(header)
+    for section in resume:
+        if section.get("type") != "experience":
+            continue
 
-    tailored.extend(fixed_top)
-    tailored.extend(ordered_experience)
-    tailored.extend(fixed_bottom)
+        existing = "\n".join("- " + c.get("description", "") for c in section.get("contributions", []))
+        base_prompt = f"""Job Description:
+{job_description}
 
-    return tailored
+Role: {section.get('title','')} at {section.get('company','')}
+Summary: {section.get('summary','')}
+Contributions:
+{existing}
 
+Generate ONE new bullet point (max 250 characters) that is:
+- Relevant to the job description
+- Results/impact-focused (numbers or outcomes if possible)
+- Not redundant with existing bullets
+Return only the bullet sentence, no leading dash.
+"""
+
+        for _ in range(bullets_per_role):
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are an expert resume writer optimizing resumes for specific job descriptions."},
+                    {"role": "user", "content": base_prompt.strip()}
+                ],
+                max_tokens=200,
+                temperature=0.5,
+            )
+            new_bullet = resp.choices[0].message.content.strip()
+            if not new_bullet:
+                continue
+
+            contrib = {
+                "description": new_bullet,
+                "skills_used": [],
+                "impact": True if mark_generated else False,
+                "source": "generated" if mark_generated else None,
+            }
+            section.setdefault("contributions", []).append(contrib)
+
+    return resume
