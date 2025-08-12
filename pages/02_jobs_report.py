@@ -3,13 +3,15 @@ import os
 import csv
 import io
 import yaml
+import json
+import re
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as dtparse
-import streamlit as st
-import re
-import pandas as pd
 from zoneinfo import ZoneInfo
 
+import numpy as np
+import pandas as pd
+import streamlit as st
 
 from job_store import (
     query_new_since,
@@ -18,6 +20,10 @@ from job_store import (
     load_latest,
     set_job_status,
 )
+
+# ====== OPTIONAL: load resume to build profile terms for score debugging ======
+# Uses same path your main app uses
+RESUME_PATH = "modular_resume_full.yaml"
 
 # ---------- Defaults ----------
 DEFAULTS_PATH = "report_defaults.yaml"
@@ -50,6 +56,14 @@ DEFAULTS_FALLBACK = {
     },
 }
 
+# -------------------- small stopword set to avoid noisy highlights --------------------
+STOPWORDS = {
+    "and","the","with","for","your","you","our","their","this","that","from","have","will","are","was",
+    "skills","experience","years","team","work","ability","in","to","of","on","as","by","or","an","be",
+    "a","at","we","us","it","its","about","who","what","when","where","how"
+}
+
+# ================== Load/save defaults ==================
 def load_defaults(path=DEFAULTS_PATH):
     if not os.path.exists(path):
         return DEFAULTS_FALLBACK.copy()
@@ -63,7 +77,7 @@ def save_defaults(cfg, path=DEFAULTS_PATH):
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
 
-# ---------- Helpers ----------
+# ================== Helpers ==================
 def parse_since(s: str) -> str:
     s = (s or "").strip().lower()
     now = datetime.now(timezone.utc)
@@ -228,12 +242,100 @@ def make_arrow_friendly(df):
         elif low == "starred":
             df[col] = df[col].astype("string")
         else:
-            # Keep text columns as string (prevents mixed object types)
             if df[col].dtype == "object":
                 df[col] = df[col].astype("string")
     return df
 
-# ---------- UI ----------
+# ================== Profile term builder (for score debugging) ==================
+def _tokenize(text: str) -> list[str]:
+    if not text:
+        return []
+    return re.findall(r"[A-Za-z0-9+\-/#\.]{3,}", text.lower())
+
+def _load_resume_terms(path=RESUME_PATH) -> dict:
+    """
+    Build a simple profile from resume YAML:
+      - all 'tags' across sections
+      - tokens from summaries/experience contributions
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            sections = yaml.safe_load(f) or []
+    except Exception:
+        return {"tags": set(), "tokens": set()}
+
+    tags = set()
+    tokens = set()
+
+    for sec in sections:
+        if isinstance(sec, dict):
+            # tags
+            for t in (sec.get("tags") or []):
+                t2 = str(t).strip().lower()
+                if t2 and t2 not in STOPWORDS:
+                    tags.add(t2)
+            # summaries/entries
+            if "summary" in sec and sec["summary"]:
+                for tok in _tokenize(sec["summary"]):
+                    if tok not in STOPWORDS:
+                        tokens.add(tok)
+            if sec.get("type") == "experience":
+                for contrib in sec.get("contributions") or []:
+                    d = (contrib or {}).get("description", "")
+                    for tok in _tokenize(d):
+                        if tok not in STOPWORDS:
+                            tokens.add(tok)
+            elif "entries" in sec and sec.get("entries"):
+                for entry in sec.get("entries") or []:
+                    if isinstance(entry, dict):
+                        for v in entry.values():
+                            for tok in _tokenize(str(v)):
+                                if tok not in STOPWORDS:
+                                    tokens.add(tok)
+    return {"tags": tags, "tokens": tokens}
+
+PROFILE = _load_resume_terms()
+
+def _job_blob(job: dict) -> str:
+    return " ".join([str(job.get("title","")), str(job.get("description",""))])
+
+def _overlap(a: set[str], b: set[str]) -> list[str]:
+    return sorted(a & b, key=lambda x: (len(x), x), reverse=True)
+
+def _interesting_tokens(tokens: list[str]) -> list[str]:
+    # Surface tokens that often matter in tech JDs
+    out = []
+    for t in tokens:
+        if t in STOPWORDS:
+            continue
+        if any(ch in t for ch in ".#+-/"):
+            out.append(t)
+        elif t.isupper() and len(t) <= 6:
+            out.append(t)   # e.g., SRE, PCI, SOC2
+    return out
+
+def _highlight(text: str, hits: set[str]) -> str:
+    if not text or not hits:
+        return text or ""
+    safe = re.sub(r"&", "&amp;", text)
+    safe = re.sub(r"<", "&lt;", safe)
+    # longest-first replacement to avoid nesting
+    for w in sorted(hits, key=len, reverse=True):
+        pattern = re.compile(rf"(?<![\w])({re.escape(w)})s?(?![\w])", flags=re.IGNORECASE)
+        safe = pattern.sub(r"<mark>\g<1></mark>", safe)
+    # Light/dark friendly mark color
+    style = """
+    <style>
+      mark { background: #ffeb99; color: #000; padding: 0 .1em; border-radius: 2px; }
+      @media (prefers-color-scheme: dark) {
+        mark { background: #775500; color: #fff; }
+      }
+      .jdbox { white-space: pre-wrap; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    </style>
+    """
+    return style + f"<div class='jdbox'>{safe}</div>"
+
+# ================== UI ==================
 st.set_page_config(page_title="Job Reports", layout="wide")
 st.title("📊 Job Reports")
 
@@ -509,20 +611,21 @@ if CHANGED_f:
     # Normalize changed_at as well
     df_changed = pd.DataFrame([
         {
-            "changed_at": fmt_est(r.get("changed_at","")),
-            "field": r.get("field",""),
-            "old_value": r.get("old_value",""),
-            "new_value": r.get("new_value",""),
-            "title": r.get("title",""),
-            "company": r.get("company",""),
-            "score": round(float(r.get("score",0.0) or 0.0),3),
-            "status": r.get("status",""),
-            "source": r.get("source",""),
-            "url": r.get("url",""),
-            "posted_at": fmt_est(r.get("posted_at","")),
-            "last_seen": fmt_est(r.get("last_seen","")),
-            "job_id": r.get("job_id","") or r.get("id",""),
-        } for r in CHANGED_f
+            "changed_at": fmt_est(r.get("changed_at", "")),
+            "field": r.get("field", ""),
+            "old_value": r.get("old_value", ""),
+            "new_value": r.get("new_value", ""),
+            "title": r.get("title", ""),
+            "company": r.get("company", ""),
+            "score": round(float(r.get("score", 0.0) or 0.0), 3),
+            "status": r.get("status", ""),
+            "source": r.get("source", ""),
+            "url": r.get("url", ""),
+            "posted_at": fmt_est(r.get("posted_at", "")),
+            "last_seen": fmt_est(r.get("last_seen", "")),
+            "job_id": r.get("job_id", "") or r.get("id", ""),
+        }
+        for r in CHANGED_f
     ])
     df_changed = make_arrow_friendly(df_changed)
     st.dataframe(
@@ -534,8 +637,9 @@ if CHANGED_f:
     st.download_button(
         "⬇️ Export 'Changed since' CSV",
         data=to_csv(CHANGED_f, field_order=[
-            "changed_at","job_id","field","old_value","new_value","title","company",
-            "score","status","source","url","posted_at","last_seen"
+            "changed_at", "job_id", "field", "old_value", "new_value",
+            "title", "company", "score", "status", "source", "url",
+            "posted_at", "last_seen"
         ]),
         file_name="jobs_changed_since.csv",
         mime="text/csv",
@@ -592,8 +696,7 @@ if LATEST_f:
 else:
     st.info("No jobs stored yet. Run your hunter first.")
 
-# ---------- Sanity check ----------
-import numpy as np
+# ---------- Score distribution ----------
 with st.expander("Score distribution (Top + New + Latest)"):
     scores = [r.get("score",0.0) for r in (TOP_f + NEW_f + LATEST_f)]
     if scores:
@@ -602,3 +705,101 @@ with st.expander("Score distribution (Top + New + Latest)"):
         st.caption(f"Min: {min(scores):.3f} | Median: {np.median(scores):.3f} | Max: {max(scores):.3f}")
     else:
         st.write("No scores to show.")
+
+# ================== NEW: Score Debugger ==================
+st.markdown("---")
+st.subheader("🔎 Score Debugger (Why is this score high/low?)")
+
+# Pool candidates for inspection (dedupe by job_id/url)
+def _dedupe(rows):
+    seen = set()
+    out = []
+    for r in rows:
+        key = r.get("job_id") or r.get("url") or r.get("id")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+ALL_ROWS = _dedupe(TOP_f + NEW_f + LATEST_f)
+
+if not ALL_ROWS:
+    st.info("No jobs available to debug. Run a hunt or relax filters.")
+else:
+    options = {
+        f"{r.get('title','(no title)')} — {r.get('company','(no company)')} [{r.get('source','src')}]": r
+        for r in ALL_ROWS[:500]
+    }
+    pick = st.selectbox("Select a job to inspect", list(options.keys()), key="dbg_pick")
+    job = options[pick]
+
+    # Basic info
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Score", f"{float(job.get('score',0.0) or 0.0):.3f}")
+    c2.metric("Source", job.get("source",""))
+    c3.metric("Posted", fmt_est(job.get("posted_at")))
+    c4.metric("Last seen", fmt_est(job.get("last_seen")))
+
+    # If your pipeline ever stores a JSON score breakdown, show it
+    score_info = job.get("score_info") or job.get("score_components")
+    if score_info:
+        try:
+            parsed = score_info if isinstance(score_info, dict) else json.loads(score_info)
+            with st.expander("Raw score components (from store)"):
+                st.json(parsed)
+        except Exception:
+            pass
+
+    # Build overlaps against your profile terms
+    title = (job.get("title") or "").strip()
+    desc = (job.get("description") or "").strip()
+    blob = _job_blob(job).lower()
+
+    job_tokens = set(_tokenize(blob)) - STOPWORDS
+    profile_tags = set(PROFILE.get("tags") or set())
+    profile_tokens = set(PROFILE.get("tokens") or set())
+
+    tag_hits = _overlap(profile_tags, job_tokens)
+    token_hits = _overlap(profile_tokens, job_tokens)
+
+    # Densities
+    n_chars = max(len(desc), 1)
+    density = (len(token_hits) / n_chars) * 1000  # hits per 1000 chars
+
+    # Title matching quick signal
+    title_tokens = set(_tokenize(title)) - STOPWORDS
+    title_overlap = len(title_tokens & (profile_tags | profile_tokens))
+    title_strength = "weak"
+    if title_overlap >= 3:
+        title_strength = "strong"
+    elif title_overlap == 2:
+        title_strength = "medium"
+
+    # Missing-but-interesting tokens (appear in job, not in your profile)
+    missing = job_tokens - (profile_tags | profile_tokens)
+    missing_interesting = _interesting_tokens(list(missing))
+    # Show top 15 by length (rough proxy for specificity)
+    missing_surfaced = sorted(set(missing_interesting), key=len, reverse=True)[:15]
+
+    with st.expander("Overlap metrics"):
+        st.write(f"- **Title strength:** {title_strength} (overlap {title_overlap})")
+        st.write(f"- **Profile tag hits:** {len(tag_hits)}")
+        st.write(f"- **Profile token hits:** {len(token_hits)}")
+        st.write(f"- **Hit density:** {density:.3f} matches / 1,000 chars of description")
+
+        if tag_hits:
+            st.write("**Matched tags:** " + ", ".join(tag_hits[:50]))
+        if token_hits:
+            st.write("**Matched tokens:** " + ", ".join(token_hits[:50]))
+
+    with st.expander("Job description with highlights (profile matches)"):
+        hits = set(tag_hits) | set(token_hits)
+        st.markdown(_highlight(desc or "(no description provided)", hits), unsafe_allow_html=True)
+
+    with st.expander("Potential keywords to add to your resume/tags"):
+        if missing_surfaced:
+            st.write(", ".join(missing_surfaced))
+            st.caption("These appear in the job text but not in your profile/tags. Consider adding if relevant.")
+        else:
+            st.write("Nothing obvious — your profile already covers most of this posting.")

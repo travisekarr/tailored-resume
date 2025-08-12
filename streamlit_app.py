@@ -441,7 +441,7 @@ st.title("🎯 Tailored Resume Generator")
 # Sidebar: cache controls
 with st.sidebar:
     st.markdown("### Tools")
-    if st.button("Clear embeddings cache"):
+    if st.button("Clear embeddings cache", key="btn_clear_cache"):
         try:
             clear_embeddings_cache()
             st.success("Embeddings cache cleared.")
@@ -455,45 +455,48 @@ resume = load_resume(RESUME_PATH)
 header = next((sec for sec in resume if sec.get("type") == "header"), None)
 
 # Inputs
-job_description = st.text_area("📝 Job Description", height=240)
+job_description = st.text_area("📝 Job Description", height=240, key="ta_job_desc")
 
 col1, col2 = st.columns(2)
 with col1:
-    summary_mode = st.radio("Summary Mode", ("Offline (free)", "GPT-powered (API cost)"), index=0)
+    summary_mode = st.radio("Summary Mode", ("Offline (free)", "GPT-powered (API cost)"), index=0, key="rad_summary_mode")
     strict_mode = summary_mode == "GPT-powered (API cost)" and st.checkbox(
         "Strict factual mode (no new claims)", value=True,
-        help="Model may only rephrase supplied facts. No new achievements or metrics."
+        help="Model may only rephrase supplied facts. No new achievements or metrics.",
+        key="chk_strict_mode"
     )
     selected_model = st.selectbox(
         "GPT Model (pricing per 1K tokens):",
         options=list(GPT_MODELS.keys()),
         format_func=lambda m: f"{m} — {GPT_MODELS[m]}",
         index=0,
+        key="sel_gpt_model"
     )
-    add_impact = st.checkbox("Add tailored impact statements (per role)", value=False)
+    add_impact = st.checkbox("Add tailored impact statements (per role)", value=False, key="chk_add_impact")
     bullets_per_role = 1
     if add_impact:
-        bullets_per_role = st.slider("Impact bullets per role", 1, 3, 1)
-    show_generated = st.checkbox("Show generated impact statements", value=True)
+        bullets_per_role = st.slider("Impact bullets per role", 1, 3, 1, key="sld_bullets_per_role")
+    show_generated = st.checkbox("Show generated impact statements", value=True, key="chk_show_generated")
 
 with col2:
-    ordering_mode = st.radio("Experience Ordering", ("Relevancy First", "Chronological", "Hybrid"), index=0)
+    ordering_mode = st.radio("Experience Ordering", ("Relevancy First", "Chronological", "Hybrid"), index=0, key="rad_ordering")
     top_n_hybrid = 3
     if ordering_mode == "Hybrid":
-        top_n_hybrid = st.slider("Top relevant items before chronological:", 1, 10, 3)
+        top_n_hybrid = st.slider("Top relevant items before chronological:", 1, 10, 3, key="sld_top_n_hybrid")
     # Embeddings options
-    use_embeddings = st.checkbox("Use semantic matching (OpenAI embeddings)", value=False)
+    use_embeddings = st.checkbox("Use semantic matching (OpenAI embeddings)", value=False, key="chk_use_embeddings")
     embedding_model = st.selectbox(
         "Embeddings model (pricing per 1M tokens):",
         options=list(EMBED_MODELS.keys()),
         format_func=lambda m: f"{m} — {EMBED_MODELS[m]}",
         index=0,
-        disabled=not use_embeddings
+        disabled=not use_embeddings,
+        key="sel_embed_model"
     )
-    highlight = st.checkbox("Highlight matches in preview", value=True)
+    highlight = st.checkbox("Highlight matches in preview", value=True, key="chk_highlight")
 
 # Generate
-if st.button("Generate Tailored Resume", use_container_width=True):
+if st.button("Generate Tailored Resume", use_container_width=True, key="btn_generate_resume"):
     if not job_description.strip():
         st.warning("Please enter a job description first.")
     else:
@@ -578,7 +581,8 @@ if "generated_html" in st.session_state:
         "📥 Download Resume as HTML",
         data=html,
         file_name=f"{base_name}.html",
-        mime="text/html"
+        mime="text/html",
+        key="dl_resume_html"
     )
 
     # Keyword chips (dark-mode safe)
@@ -627,7 +631,7 @@ if "generated_html" in st.session_state:
             st.write("Scores not available for this ordering.")
 
     # Preview mode
-    preview_mode = st.radio("Preview Mode", ("Formatted (HTML)", "Plain Text", "PDF Preview"), index=0)
+    preview_mode = st.radio("Preview Mode", ("Formatted (HTML)", "Plain Text", "PDF Preview"), index=0, key="rad_preview_mode")
     st.markdown("### 📄 Resume Preview")
 
     if preview_mode == "Formatted (HTML)":
@@ -635,7 +639,7 @@ if "generated_html" in st.session_state:
 
     elif preview_mode == "Plain Text":
         plain_text = re.sub(r"<[^>]+>", "", html)
-        st.text_area("Plain Text Resume", plain_text, height=800)
+        st.text_area("Plain Text Resume", plain_text, height=800, key="ta_plain_text")
 
     elif preview_mode == "PDF Preview":
         try:
@@ -658,7 +662,8 @@ if "generated_html" in st.session_state:
                 "📥 Download Resume as PDF",
                 data=preview_pdf,                     # same clean PDF as preview
                 file_name=f"{base_name}.pdf",
-                mime="application/pdf"
+                mime="application/pdf",
+                key="dl_resume_pdf"
             )
         except ImportError:
             st.error("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF preview.")
@@ -668,21 +673,23 @@ if "generated_html" in st.session_state:
     st.markdown("---")
     st.subheader("✉️ Cover Letter")
 
-    gen_cover = st.checkbox("Generate a cover letter", value=False)
+    gen_cover = st.checkbox("Generate a cover letter", value=False, key="chk_gen_cover")
     if gen_cover:
         # Choose model re-use
-        cl_use_gpt = (summary_mode == "GPT-powered (API cost)") and st.checkbox("Use GPT for cover letter (API cost)", value=True)
+        cl_use_gpt = (summary_mode == "GPT-powered (API cost)") and st.checkbox(
+            "Use GPT for cover letter (API cost)", value=True, key="chk_cl_use_gpt"
+        )
         cl_model = selected_model
         if cl_use_gpt:
             cl_model = st.selectbox(
                 "Cover letter model",
                 options=list(GPT_MODELS.keys()),
                 format_func=lambda m: f"{m} — {GPT_MODELS[m]}",
-                index=list(GPT_MODELS.keys()).index(selected_model) if selected_model in GPT_MODELS else 0
+                index=list(GPT_MODELS.keys()).index(selected_model) if selected_model in GPT_MODELS else 0,
+                key="sel_cl_model"
             )
 
         # Generate (once) or Regenerate
-        # pull from session_state so it works across reruns
         header_ss = st.session_state.get("header", {})
         tailored_ss = st.session_state.get("tailored", [])
         scores_map_ss = st.session_state.get("scores_map", {})
@@ -691,12 +698,12 @@ if "generated_html" in st.session_state:
 
         # Check if resume has been generated in this session
         has_resume = "tailored" in st.session_state and st.session_state.get("tailored")
-        st.button("Generate Cover Letter", disabled=not has_resume)
+        st.button("Generate Cover Letter", disabled=not has_resume, key="btn_cover_generate_gate")
 
         if not has_resume:
             st.info("Generate a tailored resume first, then create a cover letter.")
 
-        if has_resume and st.button("Generate Cover Letter"):
+        if has_resume and st.button("Generate Cover Letter", key="btn_cover_generate"):
             # sanity fallback if user tries to generate a cover letter before generating resume
             if not tailored_summary_ss:
                 # optionally regenerate a simple offline summary so we don't crash
@@ -725,12 +732,13 @@ if "generated_html" in st.session_state:
             st.session_state.cover_letter_text = st.text_area(
                 "Cover Letter (editable)",
                 st.session_state.cover_letter_text,
-                height=400
+                height=400,
+                key="ta_cover_letter"
             )
 
             # Filenames
-            cl_company = st.session_state.get("cl_company") or extract_company_name(job_description)
-            cl_role = st.session_state.get("cl_role") or extract_role_title(job_description)
+            cl_company = st.session_state.get("cl_company") or extract_company_name(st.session_state.get("job_description","") or "")
+            cl_role = st.session_state.get("cl_role") or extract_role_title(st.session_state.get("job_description","") or "")
             name_bits = []
             if cl_company:
                 name_bits.append(_clean_for_filename(cl_company))
@@ -743,7 +751,8 @@ if "generated_html" in st.session_state:
                 "📥 Download Cover Letter (TXT)",
                 data=st.session_state.cover_letter_text,
                 file_name=f"{base}.txt",
-                mime="text/plain"
+                mime="text/plain",
+                key="dl_cover_txt"
             )
 
             # Download as PDF (simple HTML wrapper)
@@ -765,7 +774,8 @@ if "generated_html" in st.session_state:
                     "📥 Download Cover Letter (PDF)",
                     data=cl_pdf,
                     file_name=f"{base}.pdf",
-                    mime="application/pdf"
+                    mime="application/pdf",
+                    key="dl_cover_pdf"
                 )
             except Exception:
                 st.info("Install WeasyPrint to enable PDF cover letter download: `pip install weasyprint`")
