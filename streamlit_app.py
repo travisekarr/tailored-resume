@@ -1,6 +1,8 @@
 import os
+import warnings
 # Suppress harmless GLib/GTK warnings from WeasyPrint on Windows
 os.environ["G_MESSAGES_DEBUG"] = "none"
+warnings.filterwarnings("ignore")
 
 import re
 import math
@@ -100,21 +102,61 @@ def extract_company_name(jd: str) -> str | None:
                 return slug
     return None
 
-# ----- Highlighter (skips NOHL-marked blocks) -----
+# ----- Role title extraction from JD (best-effort) -----
+def extract_role_title(jd: str) -> str | None:
+    text = jd.strip()
+    if not text:
+        return None
+    # 1) "Title:" label
+    m = re.search(r"(?im)^\s*(role|title)\s*[:\-]\s*(.+)$", text)
+    if m:
+        cand = m.group(2).strip()
+        cand = re.split(r"[|•\-\(\)\[\]\n\r]", cand)[0].strip()
+        return cand[:100]
+    # 2) "We are hiring a/an X", "Seeking X", "X (Job Title)"
+    m = re.search(r"(?i)\b(hiring|seek(?:ing)?|searching)\b.*?\b(for|as|a|an)\s+([A-Z][A-Za-z0-9\-/&\s]{2,})", text)
+    if m:
+        return re.sub(r"[\s\|•\-\(\)\[\]]+$", "", m.group(3)).strip()[:100]
+    # 3) First heading-ish line
+    for ln in [ln.strip() for ln in text.splitlines() if ln.strip()][:5]:
+        if len(ln) <= 80 and re.search(r"[A-Za-z]", ln) and not ln.lower().startswith(("about","company","role","position")):
+            return re.sub(r"[\|•\-–—:]+.*$", "", ln).strip()[:100]
+    return None
+
+def _clean_for_filename(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")[:80]
+
+# --- Highlighter (skips NOHL-marked blocks) ---
+import re
+
+# Add some common noise/HTML/tag words you never want highlighted
+STOPWORDS = {
+    "and","the","with","for","your","you","our","their","this","that",
+    "skills","experience","years","team","work","ability","in","to","of",
+    # HTML/tag-ish words to avoid breaking markup:
+    "strong","em","span","div","class","style","script","http","https","href","mark"
+}
+
 def build_keywords(job_description: str):
     words = re.findall(r"[A-Za-z0-9+\-/#\.]{3,}", job_description)
-    uniq = sorted({w.strip().lower() for w in words if w.strip()}, key=len, reverse=True)
-    return uniq[:200]
+    uniq = {
+        w.strip().lower()
+        for w in words
+        if w.strip() and w.strip().lower() not in STOPWORDS
+    }
+    # long-first to avoid partial overlaps
+    return sorted(uniq, key=len, reverse=True)[:200]
 
 def _highlight_fragment(fragment: str, keywords):
     out = fragment
     for w in keywords:
-        # case-insensitive, don't cross tags
+        # Do NOT match when inside tag names or closing tags:
+        #   - previous char cannot be a word char, '>', '<', or '/'
+        #   - next char cannot be a word char or '<'
         pattern = re.compile(
-            rf"(?<![\w>])({re.escape(w)})(?![\w<])",
+            rf"(?<![\w><\/])({re.escape(w)})(?![\w<])",
             flags=re.IGNORECASE,
         )
-        # IMPORTANT: use \g<1>, not \1, and don't double-escape
         out = pattern.sub(r"<mark>\g<1></mark>", out)
     return out
 
@@ -122,6 +164,7 @@ def highlight_html(html: str, job_description: str):
     keywords = build_keywords(job_description)
     if not keywords:
         return html
+    # keep header/contact area safe from highlighting
     parts = re.split(r"(<!--NOHL_START-->.*?<!--NOHL_END-->)", html, flags=re.DOTALL)
     for i, part in enumerate(parts):
         if part.startswith("<!--NOHL_START-->"):
@@ -286,6 +329,111 @@ def generate_tailored_summary(
     except Exception:
         return _offline()
 
+# ----- Cover Letter generation -----
+def _collect_top_relevant_bullets(resume, scores_map, max_bullets=3):
+    # Grab the highest-scoring experience bullets (if score map exists), else take first few bullets
+    bullets = []
+    # Try scored experiences first
+    exp_sections = [s for s in resume if s.get("type") == "experience"]
+    # Attach scores if we have them
+    scored = []
+    for s in exp_sections:
+        sc = scores_map.get(id(s), s.get("_score", 0))
+        scored.append((sc or 0, s))
+    scored.sort(reverse=True, key=lambda x: x[0])
+    for _, sec in scored:
+        for c in sec.get("contributions", []):
+            d = c.get("description")
+            if isinstance(d, str) and d.strip():
+                bullets.append(d.strip())
+            if len(bullets) >= max_bullets:
+                return bullets
+    # Fallback: first available bullets
+    if not bullets:
+        for sec in exp_sections:
+            for c in sec.get("contributions", []):
+                d = c.get("description")
+                if isinstance(d, str) and d.strip():
+                    bullets.append(d.strip())
+                if len(bullets) >= max_bullets:
+                    return bullets
+    return bullets[:max_bullets]
+
+def _offline_cover_letter(header, company, role, tailored_summary, bullets):
+    name = header.get("name", "")
+    loc = header.get("location", "")
+    email = header.get("email", "")
+    phone = header.get("phone", "")
+
+    greeting = f"Dear Hiring Manager{f' at {company}' if company else ''},"
+    p1 = f"I’m excited to apply for the {role or 'open'} position{f' at {company}' if company else ''}. {tailored_summary}"
+    if bullets:
+        p2 = "Here are a few highlights that align with your needs:\n" + "\n".join(f"- {b}" for b in bullets)
+    else:
+        p2 = "I believe my experience closely aligns with your requirements and would welcome the opportunity to discuss how I can contribute."
+
+    p3 = "Thank you for your time and consideration. I would welcome the opportunity to discuss how my background can help your team deliver results."
+
+    footer = f"\nSincerely,\n{name}\n{loc}\n{email} | {phone}".strip()
+    return "\n\n".join([greeting, p1, p2, p3, footer]).strip()
+
+def _cover_letter_prompt(header, company, role, tailored_summary, bullets, job_description):
+    name = header.get("name", "")
+    contact = f"{header.get('email','')} | {header.get('phone','')}"
+    facts_block = f"""
+Candidate:
+- Name: {name}
+- Contact: {contact}
+- Tailored Summary: {tailored_summary}
+- Top Highlights:
+{chr(10).join(f'- {b}' for b in bullets) if bullets else '- (none)'}
+"""
+    prompt = f"""
+You write concise, professional cover letters. Use only the facts provided.
+Do not invent employers, titles, or metrics. Keep to 180–250 words.
+
+Company: {company or '(unspecified)'}
+Role: {role or '(unspecified)'}
+
+Job Description (for tone and alignment only):
+{job_description}
+
+Facts you may use verbatim:
+{facts_block}
+
+Write a 3-paragraph cover letter:
+1) Short intro referencing the role/company.
+2) Middle paragraph aligning 2–3 specific highlights to likely needs.
+3) Brief closing with a polite call to action.
+
+Return plain text only. No salutations beyond the greeting/sign-off.
+Sign off as: {name}
+"""
+    return prompt.strip()
+
+def generate_cover_letter(header, resume, scores_map, job_description, tailored_summary, use_gpt=False, model="gpt-3.5-turbo"):
+    company = extract_company_name(job_description)
+    role = extract_role_title(job_description)
+    bullets = _collect_top_relevant_bullets(resume, scores_map or {}, max_bullets=3)
+
+    if not use_gpt:
+        return _offline_cover_letter(header, company, role, tailored_summary, bullets), company, role
+
+    prompt = _cover_letter_prompt(header, company, role, tailored_summary, bullets, job_description)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role":"system","content":"You create professional, concise cover letters using only provided facts."},
+            {"role":"user","content": prompt},
+        ],
+        temperature=0.4,
+        max_tokens=500,
+    )
+    text = resp.choices[0].message.content.strip()
+    # Soft sanity trim
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text, company, role
+
 # ==== UI ====
 st.set_page_config(page_title="Tailored Resume Builder", layout="wide")
 st.title("🎯 Tailored Resume Generator")
@@ -409,6 +557,10 @@ if st.button("Generate Tailored Resume", use_container_width=True):
         st.session_state.keywords = matched
         st.session_state.scores_map = scores_map
         st.session_state.base_name = base_name
+        st.session_state.tailored_summary = tailored_summary
+        st.session_state.header = header
+        st.session_state.job_description = job_description
+
 
 # Preview & Download + Scores & Keywords
 if "generated_html" in st.session_state:
@@ -502,3 +654,109 @@ if "generated_html" in st.session_state:
             )
         except ImportError:
             st.error("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF preview.")
+
+    # ========= Cover Letter =========
+    st.markdown("---")
+    st.subheader("✉️ Cover Letter")
+
+    gen_cover = st.checkbox("Generate a cover letter", value=False)
+    if gen_cover:
+        # Choose model re-use
+        cl_use_gpt = (summary_mode == "GPT-powered (API cost)") and st.checkbox("Use GPT for cover letter (API cost)", value=True)
+        cl_model = selected_model
+        if cl_use_gpt:
+            cl_model = st.selectbox(
+                "Cover letter model",
+                options=list(GPT_MODELS.keys()),
+                format_func=lambda m: f"{m} — {GPT_MODELS[m]}",
+                index=list(GPT_MODELS.keys()).index(selected_model) if selected_model in GPT_MODELS else 0
+            )
+
+        # Generate (once) or Regenerate
+        # pull from session_state so it works across reruns
+        header_ss = st.session_state.get("header", {})
+        tailored_ss = st.session_state.get("tailored", [])
+        scores_map_ss = st.session_state.get("scores_map", {})
+        job_desc_ss = st.session_state.get("job_description", "")
+        tailored_summary_ss = st.session_state.get("tailored_summary", "")
+
+        # Check if resume has been generated in this session
+        has_resume = "tailored" in st.session_state and st.session_state.get("tailored")
+        st.button("Generate Cover Letter", disabled=not has_resume)
+
+        if not has_resume:
+            st.info("Generate a tailored resume first, then create a cover letter.")
+
+        if has_resume and st.button("Generate Cover Letter"):
+            # sanity fallback if user tries to generate a cover letter before generating resume
+            if not tailored_summary_ss:
+                # optionally regenerate a simple offline summary so we don't crash
+                tailored_summary_ss = generate_tailored_summary(
+                    resume,
+                    job_desc_ss or (st.session_state.get("job_description") or ""),
+                    use_gpt=False
+                )
+
+            cl_text, cl_company, cl_role = generate_cover_letter(
+                header_ss,
+                tailored_ss,                 # use tailored sections for bullets
+                scores_map_ss,
+                job_desc_ss,
+                tailored_summary_ss,
+                use_gpt=cl_use_gpt,
+                model=cl_model
+            )
+            st.session_state.cover_letter_text = cl_text
+            st.session_state.cl_company = cl_company
+            st.session_state.cl_role = cl_role
+
+        # Editable preview textarea
+        if "cover_letter_text" in st.session_state:
+            st.markdown("You can edit before downloading:")
+            st.session_state.cover_letter_text = st.text_area(
+                "Cover Letter (editable)",
+                st.session_state.cover_letter_text,
+                height=400
+            )
+
+            # Filenames
+            cl_company = st.session_state.get("cl_company") or extract_company_name(job_description)
+            cl_role = st.session_state.get("cl_role") or extract_role_title(job_description)
+            name_bits = []
+            if cl_company:
+                name_bits.append(_clean_for_filename(cl_company))
+            if cl_role:
+                name_bits.append(_clean_for_filename(cl_role))
+            base = "_".join(name_bits) + "_cover_letter" if name_bits else "cover_letter"
+
+            # Download as TXT
+            st.download_button(
+                "📥 Download Cover Letter (TXT)",
+                data=st.session_state.cover_letter_text,
+                file_name=f"{base}.txt",
+                mime="text/plain"
+            )
+
+            # Download as PDF (simple HTML wrapper)
+            try:
+                from weasyprint import HTML as WPHTML
+                cl_html = f"""<!doctype html><html><head>
+                <meta charset="utf-8">
+                <style>
+                  body {{ font-family: Arial, sans-serif; font-size: 11pt; margin: 40px; }}
+                  p {{ margin: 0 0 10px 0; }}
+                  pre {{ white-space: pre-wrap; }}
+                </style></head><body>
+                <pre>{st.session_state.cover_letter_text}</pre>
+                </body></html>"""
+                buf = BytesIO()
+                WPHTML(string=cl_html).write_pdf(buf)
+                cl_pdf = buf.getvalue()
+                st.download_button(
+                    "📥 Download Cover Letter (PDF)",
+                    data=cl_pdf,
+                    file_name=f"{base}.pdf",
+                    mime="application/pdf"
+                )
+            except Exception:
+                st.info("Install WeasyPrint to enable PDF cover letter download: `pip install weasyprint`")

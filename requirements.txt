@@ -14,3 +14,13 @@ beautifulsoup4>=4.12.2
 
 # Optional: For regex and text handling improvements
 regex>=2023.6.3
+
+# Job Finder additions
+requests
+feedparser
+python-dateutil
+
+#description pull additions
+trafilatura
+beautifulsoup4
+lxml

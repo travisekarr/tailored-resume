@@ -1,0 +1,47 @@
+# job_sources.yaml
+# Each source is either a Greenhouse board, Lever board, or an RSS/Atom feed.
+# Add/remove companies as you like.
+
+aggregators:
+  remotive:
+    enabled: true
+    categories: ["software-dev"]
+    queries: ["engineering manager", "devops", "sre", "software development", "development manager", "director engineering", "netsuite"]
+    limit: 200
+
+  remoteok:
+    enabled: true
+    tags_include: ["engineering", "manager", "devops", "sre", "node", "python", "director", "software", "netsuite"]
+    tags_exclude: ["intern", "analyst"]
+
+  weworkremotely:
+    enabled: true
+    feeds:
+      - https://weworkremotely.com/categories/remote-programming-jobs.rss
+      - https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss
+      - https://weworkremotely.com/remote-jobs.rss
+
+  hnrss:
+    enabled: true
+    feed: https://hnrss.org/jobs
+
+filters:
+  include: ["engineering manager", "devops", "sre", "software development", "development manager", "director engineering", "netsuite"]
+  exclude: ["intern", "senior analyst"]
+
+defaults:
+  remote_only: true
+  max_results: 1000
+  dedupe_key: "company|title|canonical_url"
+  min_score: 0.0
+  fetch_full_descriptions: true   # turn enrichment on/off
+
+  # Optional tuning (shown with sensible defaults):
+  enrichment:
+    max_fetch: 100                # max pages to fetch per run
+    only_if_shorter_than: 400     # only fetch if current desc < this many chars
+    min_chars: 600                # accept fetched text only if >= this many chars
+    rate_limit_s: 1.0             # polite delay between fetches
+    timeout_s: 20                 # per-request timeout
+    user_agent: "Mozilla/5.0 (job-hunter)"
+    # sources: ["remoteok","weworkremotely","hnrss"]  # restrict to these sources; omit to use defaults
