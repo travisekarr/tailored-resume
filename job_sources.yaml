@@ -2,33 +2,6 @@
 # Each source is either a Greenhouse board, Lever board, or an RSS/Atom feed.
 # Add/remove companies as you like.
 
-aggregators:
-  remotive:
-    enabled: true
-    categories: ["software-dev"]
-    queries: ["engineering manager", "devops", "sre", "software development", "development manager", "director engineering", "netsuite"]
-    limit: 200
-
-  remoteok:
-    enabled: true
-    tags_include: ["engineering", "manager", "devops", "sre", "node", "python", "director", "software", "netsuite"]
-    tags_exclude: ["intern", "analyst"]
-
-  weworkremotely:
-    enabled: true
-    feeds:
-      - https://weworkremotely.com/categories/remote-programming-jobs.rss
-      - https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss
-      - https://weworkremotely.com/remote-jobs.rss
-
-  hnrss:
-    enabled: true
-    feed: https://hnrss.org/jobs
-
-filters:
-  include: ["engineering manager", "devops", "sre", "software development", "development manager", "director engineering", "netsuite"]
-  exclude: ["intern", "senior analyst"]
-
 defaults:
   remote_only: true
   max_results: 1000
@@ -45,3 +18,103 @@ defaults:
     timeout_s: 20                 # per-request timeout
     user_agent: "Mozilla/5.0 (job-hunter)"
     # sources: ["remoteok","weworkremotely","hnrss"]  # restrict to these sources; omit to use defaults
+
+filters:
+  include: ["engineering manager", "devops", "sre", "software development", "development manager", "director engineering", "netsuite","platform", "kubernetes", "aws", "ci/cd"]
+  exclude: ["intern", "senior analyst"]
+
+aggregators:
+
+  remotive:
+    enabled: true
+    queries: ["engineering manager", "platform", "devops"]
+    categories: []
+    limit: 500
+
+  remoteok:
+    enabled: true
+
+  weworkremotely:
+    enabled: true
+    feeds:
+      - https://weworkremotely.com/remote-programming-jobs.rss
+      - https://weworkremotely.com/remote-devops-sysadmin-jobs.rss
+
+  hnrss:
+    enabled: true
+    feed: https://hnrss.org/jobs
+
+  jobicy:
+    enabled: true
+    # api: https://jobicy.com/api/v2/remote-jobs
+    count: 300
+
+  arbeitnow:
+    enabled: true
+    pages: 2
+
+  usajobs:
+    enabled: false
+    keyword: "software"
+    results_per_page: 100
+    who: "all"
+    # api_key: YOUR_KEY   # or env USAJOBS_API_KEY
+    # user_agent: you@domain.com
+
+  adzuna:
+    enabled: false
+    country: "us"
+    what: "software"
+    where: ""
+    pages: 1
+    per_page: 50
+    # app_id: YOUR_ID     # or env ADZUNA_APP_ID
+    # app_key: YOUR_KEY   # or env ADZUNA_APP_KEY
+
+  jooble:
+    enabled: false
+    keywords: "software"
+    location: ""
+    radius: 0
+    size: 50
+    # api_key: YOUR_KEY   # or env JOOBLE_API_KEY
+
+  themuse:
+    enabled: false
+    category: "Software Engineering"
+    pages: 2
+
+  findwork:
+    enabled: false
+    search: "platform devops manager"
+    limit: 100
+    # api_key: YOUR_TOKEN  # or env FINDWORK_API_KEY
+
+  greenhouse:
+    enabled: true
+    companies: ["openai", "cloudflare", "datadog"]
+
+  lever:
+    enabled: true
+    companies: ["stripe", "ramp", "notion"]
+
+  workable:
+    enabled: true
+    accounts: ["zapier", "automattic"]
+
+  smartrecruiters:
+    enabled: true
+    companies: ["snowflake", "square"]
+
+  recruitee:
+    enabled: true
+    companies: ["mollie", "gitbook"]
+
+  personio:
+    enabled: true
+    domains: ["celonis.jobs.personio.de"]
+
+  rss:
+    enabled: false
+    feeds:
+      - https://stackoverflow.com/jobs/feed?searchTerm=devops

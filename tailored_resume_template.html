@@ -25,6 +25,15 @@
       /* Make highlights readable in dark mode */
       mark { background: #777; color: #fff; }
     }
+    @media print {
+      mark {
+        background: none !important;
+        color: inherit !important;
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
+    }
+
   </style>
 </head>
 <body>

@@ -640,20 +640,29 @@ if "generated_html" in st.session_state:
     elif preview_mode == "PDF Preview":
         try:
             from weasyprint import HTML as WPHTML
-            pdf_buffer = BytesIO()
-            WPHTML(string=highlighted_html).write_pdf(pdf_buffer)  # preview reflects highlighting
-            pdf_data = pdf_buffer.getvalue()
-            b64_pdf = base64.b64encode(pdf_data).decode("utf-8")
-            pdf_display = f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
-            st.markdown(pdf_display, unsafe_allow_html=True)
+            import base64
+            from io import BytesIO
+
+            # ❗ Preview AND download should be generated from the CLEAN HTML (no highlights)
+            preview_buf = BytesIO()
+            WPHTML(string=html).write_pdf(preview_buf)   # use clean HTML, not highlighted_html
+            preview_pdf = preview_buf.getvalue()
+
+            b64_pdf = base64.b64encode(preview_pdf).decode("utf-8")
+            st.markdown(
+                f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="800" type="application/pdf"></iframe>',
+                unsafe_allow_html=True
+            )
+
             st.download_button(
                 "📥 Download Resume as PDF",
-                data=pdf_data,
+                data=preview_pdf,                     # same clean PDF as preview
                 file_name=f"{base_name}.pdf",
                 mime="application/pdf"
             )
         except ImportError:
             st.error("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF preview.")
+
 
     # ========= Cover Letter =========
     st.markdown("---")

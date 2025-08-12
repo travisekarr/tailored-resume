@@ -591,3 +591,14 @@ if LATEST_f:
     section_update_controls("Latest seen", LATEST_f, db_path)
 else:
     st.info("No jobs stored yet. Run your hunter first.")
+
+# ---------- Sanity check ----------
+import numpy as np
+with st.expander("Score distribution (Top + New + Latest)"):
+    scores = [r.get("score",0.0) for r in (TOP_f + NEW_f + LATEST_f)]
+    if scores:
+        hist, bins = np.histogram(scores, bins=20, range=(0.0, 1.0))
+        st.bar_chart(hist)
+        st.caption(f"Min: {min(scores):.3f} | Median: {np.median(scores):.3f} | Max: {max(scores):.3f}")
+    else:
+        st.write("No scores to show.")
