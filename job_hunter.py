@@ -1,6 +1,7 @@
 # job_hunter.py
 import os
 import re
+_re = re
 import json
 import time
 import math
@@ -31,7 +32,6 @@ try:
     from bs4 import BeautifulSoup
 except Exception:
     BeautifulSoup = None
-
 
 # -----------------------------
 # Utilities & logging
@@ -90,6 +90,22 @@ def _http_post_json(url: str, payload: dict, logs: list, headers: Optional[dict]
         _log(logs, "http.error", {"url": url, "error": str(e)})
         return None, str(e)
 
+def _stringify(x) -> str:
+    """Safely turn any nested structure into plain text."""
+    if x is None:
+        return ""
+    if isinstance(x, bytes):
+        try:
+            return x.decode("utf-8", "ignore")
+        except Exception:
+            return ""
+    if isinstance(x, (int, float, bool)):
+        return str(x)
+    if isinstance(x, dict):
+        return " ".join(_stringify(v) for v in x.values())
+    if isinstance(x, (list, tuple, set)):
+        return " ".join(_stringify(v) for v in x)
+    return str(x)
 
 # -----------------------------
 # YAML loader (with legacy support)
@@ -249,6 +265,133 @@ def fetch_rss(feed_url: str, source: str, logs: list) -> List[dict]:
         })
     return out
 
+# --- add near the other imports ---
+import html as _html
+import math as _math
+try:
+    import tiktoken as _tiktoken  # optional, improves token estimates if installed
+except Exception:
+    _tiktoken = None
+
+# ---------- Embedding batching helpers ----------
+# Safe budgets; tweak down if you still see "max_tokens_per_request"
+_EMBED_REQ_TOKEN_BUDGET = 250_000      # per request (below the 300k hard cap)
+_MAX_CHARS_PER_INPUT   = 8_000         # ~2k tokens (roughly 4 chars/token); trims very long JDs
+
+# If you already have a global OpenAI client named _openai_client in this file, we reuse it.
+
+
+def _estimate_tokens(text: str, model: str = "text-embedding-3-small") -> int:
+    """Rough token estimate. Uses tiktoken if available, falls back to 4 chars/token."""
+    s = text or ""
+    if _tiktoken:
+        try:
+            enc = _tiktoken.encoding_for_model(model)
+        except Exception:
+            enc = _tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(s))
+    # crude heuristic
+    return max(1, (len(s) // 4) + 1)
+
+def _clean_for_embedding(s) -> str:
+    """
+    Normalize arbitrary input to a clean, space-separated string
+    suitable for embeddings/TF-IDF.
+    """
+    # Force to string first (avoids TypeError when dict/list/None leaks in)
+    s = _stringify(s)
+
+    # Unescape entities, strip tags & code fences, collapse whitespace
+    s = _html.unescape(s)
+    s = _re.sub(r"<[^>]+>", " ", s)                     # remove HTML tags
+    s = _re.sub(r"`{3,}.*?`{3,}", " ", s, flags=_re.S)  # remove ```code``` blocks
+    s = _re.sub(r"`([^`]+)`", r"\1", s)                 # inline code ticks
+    s = _re.sub(r"[ \t\r\f\v]+", " ", s)
+    s = _re.sub(r"\s*\n+\s*", "\n", s)
+    s = s.strip().lower()
+
+    # Hard-trim very long inputs to keep embedding requests modest
+    if len(s) > _MAX_CHARS_PER_INPUT:
+        s = s[:_MAX_CHARS_PER_INPUT]
+    return s
+
+def _chunk_by_token_budget(texts: list[str], model: str, budget: int) -> list[list[str]]:
+    """Split texts into batches whose combined token estimate stays under budget."""
+    batches, current, current_tokens = [], [], 0
+    for t in texts:
+        tt = _estimate_tokens(t, model)
+        # if single item exceeds budget, still send alone (API will handle per-input limits)
+        if current and current_tokens + tt > budget:
+            batches.append(current)
+            current, current_tokens = [], 0
+        current.append(t)
+        current_tokens += tt
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _cosine_sim(vec_a, vec_b) -> float:
+    num = sum(a*b for a, b in zip(vec_a, vec_b))
+    da = _math.sqrt(sum(a*a for a in vec_a))
+    db = _math.sqrt(sum(b*b for b in vec_b))
+    return (num / (da * db)) if da and db else 0.0
+
+
+def _score_embeddings(resume_text: str,
+                      job_texts: list[str],
+                      embedding_model: str = "text-embedding-3-small") -> list[float]:
+    """
+    Robust embedding-based scoring:
+      - cleans & trims each input
+      - embeds resume once
+      - embeds jobs in token-budgeted batches
+      - returns cosine similarity scores aligned to job_texts order
+    """
+    # 1) Clean & trim
+    resume_clean = _clean_for_embedding(resume_text or "")
+    jobs_clean   = [_clean_for_embedding(t or "") for t in job_texts]
+
+    # 2) Embed resume once
+    res = _openai_client.embeddings.create(model=embedding_model, input=resume_clean)
+    resume_vec = res.data[0].embedding
+
+    # 3) Batch-embed jobs under safe token budget
+    scores: list[float] = []
+    # chunk respecting token budget
+    batches = _chunk_by_token_budget(jobs_clean, embedding_model, _EMBED_REQ_TOKEN_BUDGET)
+
+    for batch in batches:
+        if not batch:
+            continue
+        try:
+            resp = _openai_client.embeddings.create(model=embedding_model, input=batch)
+        except Exception as e:
+            # If we still somehow hit max-tokens error, cut the batch further and retry once
+            # (very defensive; usually not needed because of the budget above)
+            if hasattr(e, "message") and "max_tokens_per_request" in str(e):
+                # halve the budget and retry this batch in smaller chunks
+                sub_batches = _chunk_by_token_budget(batch, embedding_model, max(50_000, _EMBED_REQ_TOKEN_BUDGET // 2))
+                for sub in sub_batches:
+                    sub_resp = _openai_client.embeddings.create(model=embedding_model, input=sub)
+                    for d in sub_resp.data:
+                        scores.append(_cosine_sim(resume_vec, d.embedding))
+                continue
+            # re-raise other errors
+            raise
+
+        for d in resp.data:
+            scores.append(_cosine_sim(resume_vec, d.embedding))
+
+    # 4) Ensure length alignment (should match len(job_texts))
+    if len(scores) != len(job_texts):
+        # pad or trim just in case
+        if len(scores) < len(job_texts):
+            scores += [0.0] * (len(job_texts) - len(scores))
+        else:
+            scores = scores[:len(job_texts)]
+
+    return scores
 
 # -----------------------------
 # Aggregators
@@ -340,8 +483,56 @@ def fetch_weworkremotely(cfg: dict, logs: list) -> List[dict]:
         return []
     feeds = cfg.get("feeds") or ["https://weworkremotely.com/remote-jobs.rss"]
     results: List[dict] = []
+
     for u in feeds:
-        results.extend(fetch_rss(u, "weworkremotely", logs))
+        _log(logs, "rss.fetch", {"url": u, "source": "weworkremotely"})
+        try:
+            f = feedparser.parse(u)
+        except Exception as e:
+            _log(logs, "rss.parse_error", {"url": u, "error": str(e), "source": "weworkremotely"})
+            continue
+
+        for e in f.entries:
+            url = e.get("link") or ""
+            title_raw = (e.get("title") or "").strip()
+            desc = e.get("summary") or e.get("description") or ""
+            posted = e.get("published") or e.get("updated") or None
+
+            company = ""
+            title = title_raw
+
+            # Primary split: "Company: Title"
+            if ":" in title_raw:
+                left, right = title_raw.split(":", 1)
+                if left.strip() and right.strip():
+                    company, title = left.strip(), right.strip()
+
+            # Optional fallback if some feeds use a semicolon
+            elif ";" in title_raw:
+                left, right = title_raw.split(";", 1)
+                if left.strip() and right.strip():
+                    company, title = left.strip(), right.strip()
+
+            else:
+                # Fallback: "... at Company"
+                m = re.search(r"\bat\s+([^-–—\|]+)$", title_raw, flags=re.I)
+                if m:
+                    company = m.group(1).strip()
+                    title = re.sub(r"\s+\bat\s+[^\-–—\|]+$", "", title_raw, flags=re.I).strip()
+
+            results.append({
+                "id": _hash_id(url or title_raw),
+                "title": title,
+                "company": company,
+                "location": "",
+                "remote": True,
+                "url": url,
+                "source": "weworkremotely",
+                "posted_at": posted,
+                "pulled_at": utcnow(),
+                "description": desc,
+            })
+
     return results
 
 def fetch_hnrss(cfg: dict, logs: list) -> List[dict]:

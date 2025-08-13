@@ -19,6 +19,8 @@ from job_store import (
     query_top_matches,
     load_latest,
     set_job_status,
+    clear_jobs_data, 
+    nuke_database,
 )
 
 # ====== OPTIONAL: load resume to build profile terms for score debugging ======
@@ -406,6 +408,32 @@ with st.sidebar:
         ["title","location","url","posted_at","description_sha","score","status","user_notes","starred"],
         fdefs.get("changed_fields") or []
     )
+
+    st.markdown("---")
+    st.subheader("Danger zone")
+
+    st.caption("Type **WIPE** to clear rows (keep schema) or **NUKE** to delete & recreate the DB file.")
+    confirm_txt = st.text_input("Confirm action", value="", help="Enter WIPE or NUKE (ALL CAPS)")
+
+    c_wipe, c_nuke = st.columns(2)
+    with c_wipe:
+        if st.button("🧹 WIPE rows"):
+            if confirm_txt.strip().upper() == "WIPE":
+                res = clear_jobs_data(db_path, include_runs=True, vacuum=True)
+                st.success(f"Wiped rows. jobs={res['jobs_deleted']} runs={res['runs_deleted']}.")
+            else:
+                st.error("Type WIPE (all caps) to confirm.")
+
+    with c_nuke:
+        if st.button("💣 NUKE file"):
+            if confirm_txt.strip().upper() == "NUKE":
+                ok = nuke_database(db_path)
+                if ok:
+                    st.success("Database file deleted and re-initialized.")
+                else:
+                    st.error("Failed to delete/recreate the database file (possibly locked). Close other apps and try again.")
+            else:
+                st.error("Type NUKE (all caps) to confirm.")
 
     st.markdown("---")
     left, right = st.columns(2)

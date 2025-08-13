@@ -24,3 +24,5 @@ python-dateutil
 trafilatura
 beautifulsoup4
 lxml
+
+tiktoken

@@ -1,14 +1,19 @@
 # job_store.py
 import os
+import json
 import sqlite3
 from typing import Iterable, List, Dict, Any, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 DB_PATH = os.environ.get("JOBS_DB_PATH", "jobs.db")
 
-from datetime import datetime, timezone
+# ---------------------------
+# Time / ISO helpers
+# ---------------------------
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def _to_iso(dt_or_str) -> str | None:
+def _to_iso(dt_or_str) -> Optional[str]:
     """Accepts datetime or string and returns ISO-8601 (UTC) string."""
     if dt_or_str is None:
         return None
@@ -22,6 +27,29 @@ def _to_iso(dt_or_str) -> str | None:
         return s + "T00:00:00+00:00"
     return s
 
+def _to_iso_compat(s: str) -> str:
+    """Accepts ISO, 'YYYY-MM-DD', or relative like '24h', '7d'."""
+    if not s:
+        return utcnow()
+    s = s.strip().replace("Z", "+00:00")
+    try:
+        if s.endswith("h"):
+            hrs = float(s[:-1]); return (datetime.now(timezone.utc) - timedelta(hours=hrs)).isoformat()
+        if s.endswith("d"):
+            days = float(s[:-1]); return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    except Exception:
+        pass
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
+    except Exception:
+        return utcnow()
+
+# ---------------------------
+# DB bootstrap / connect
+# ---------------------------
 DDL = """
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
@@ -37,195 +65,28 @@ CREATE TABLE IF NOT EXISTS jobs (
   score REAL,
   hash_key TEXT,
   created_at TEXT,
-  updated_at TEXT
+  updated_at TEXT,
+  -- optional columns that may be added later:
+  status TEXT,
+  status_notes TEXT,
+  status_updated_at TEXT,
+  starred INTEGER DEFAULT 0,
+  first_seen TEXT,
+  last_seen TEXT,
+  resume_path TEXT,
+  resume_score REAL
 );
-CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source);
-CREATE INDEX IF NOT EXISTS idx_jobs_posted_at ON jobs(posted_at);
-CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score);
-CREATE INDEX IF NOT EXISTS idx_jobs_hash ON jobs(hash_key);
+CREATE INDEX IF NOT EXISTS idx_jobs_source      ON jobs(source);
+CREATE INDEX IF NOT EXISTS idx_jobs_posted_at   ON jobs(posted_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_score       ON jobs(score);
+CREATE INDEX IF NOT EXISTS idx_jobs_hash        ON jobs(hash_key);
+CREATE INDEX IF NOT EXISTS idx_jobs_pulled_at   ON jobs(pulled_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_updated_at  ON jobs(updated_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_created_at  ON jobs(created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_status      ON jobs(status);
 """
 
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def connect(db_path: Optional[str] = None) -> sqlite3.Connection:
-    path = db_path or DB_PATH
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-def init_db(db_path: Optional[str] = None) -> None:
-    with connect(db_path) as conn:
-        for stmt in DDL.strip().split(";"):
-            s = stmt.strip()
-            if s:
-                conn.execute(s)
-
-def _coerce_bool(b) -> int:
-    return 1 if b in (True, "true", "True", 1) else 0
-
-def _hash_key(it: Dict[str, Any]) -> str:
-    # fallback dedupe key used for pruning/reporting
-    company = (it.get("company") or "").strip().lower()
-    title = (it.get("title") or "").strip().lower()
-    url = (it.get("url") or "").strip().lower()
-    return f"{company}|{title}|{url}"
-
-def store_jobs(items: Iterable[Dict[str, Any]], db_path: Optional[str] = None) -> Dict[str, int]:
-    """
-    Upsert by id. Keeps first pulled_at; updates other fields.
-    Returns counts: {'inserted': X, 'updated': Y}
-    """
-    init_db(db_path)
-    ins, upd = 0, 0
-    now = utcnow()
-    with connect(db_path) as conn:
-        cur = conn.cursor()
-        for it in items:
-            row = {
-                "id": it.get("id") or it.get("url"),
-                "title": it.get("title") or "",
-                "company": it.get("company") or "",
-                "location": it.get("location") or "",
-                "remote": _coerce_bool(it.get("remote")),
-                "url": it.get("url") or "",
-                "source": it.get("source") or "",
-                "posted_at": it.get("posted_at"),
-                "pulled_at": now,
-                "description": it.get("description") or "",
-                "score": float(it.get("score") or 0.0),
-                "hash_key": _hash_key(it),
-                "created_at": now,
-                "updated_at": now,
-            }
-            # Try insert; if conflict, update (keeping original created_at/pulled_at)
-            qry = """
-            INSERT INTO jobs (id, title, company, location, remote, url, source, posted_at, pulled_at, description, score, hash_key, created_at, updated_at)
-            VALUES (:id,:title,:company,:location,:remote,:url,:source,:posted_at,:pulled_at,:description,:score,:hash_key,:created_at,:updated_at)
-            ON CONFLICT(id) DO UPDATE SET
-              title=excluded.title,
-              company=excluded.company,
-              location=excluded.location,
-              remote=excluded.remote,
-              url=excluded.url,
-              source=excluded.source,
-              posted_at=COALESCE(excluded.posted_at, jobs.posted_at),
-              description=excluded.description,
-              score=excluded.score,
-              hash_key=excluded.hash_key,
-              updated_at=excluded.updated_at
-            """
-            try:
-                cur.execute(qry, row)
-                if cur.rowcount == 1 and cur.lastrowid is not None:
-                    # SQLite returns 0 lastrowid on upsert; use changes() to detect
-                    pass
-                # We can’t directly tell insert/update; check if previously existed
-                # Quick approach: see if changes() == 1 and there was no existing row by doing a select first
-            except sqlite3.IntegrityError:
-                pass
-        conn.commit()
-        # Rough counts: count how many ids already existed
-        # Simpler: recompute via SELECT
-        # (If you want perfect counts, track existence before upsert; keeping simple)
-    # Provide counts as a convenience: treat all as inserted for now
-    # If you want exact counts, call exists check before each insert.
-    # To keep it useful, return total items as inserted+updated:
-    total = 0
-    for _ in items:
-        total += 1
-    return {"inserted": total, "updated": 0}
-
-def query_jobs(
-    db_path: Optional[str] = None,
-    sources: Optional[List[str]] = None,
-    min_score: float = 0.0,
-    posted_start: Optional[str] = None,
-    posted_end: Optional[str] = None,
-    q: Optional[str] = None,
-    limit: int = 500,
-    order: str = "score_desc"
-) -> List[Dict[str, Any]]:
-    init_db(db_path)
-    where = []
-    params: Dict[str, Any] = {}
-
-    if sources:
-        ph = ",".join(["?"] * len(sources))
-        where.append(f"source IN ({ph})")
-    if min_score > 0.0:
-        where.append("score >= ?")
-        params[len(params)] = float(min_score)
-    if posted_start:
-        where.append("posted_at IS NOT NULL AND posted_at >= ?")
-        params[len(params)] = posted_start
-    if posted_end:
-        where.append("posted_at IS NOT NULL AND posted_at <= ?")
-        params[len(params)] = posted_end
-    if q:
-        where.append("(title LIKE ? OR company LIKE ? OR description LIKE ?)")
-        params[len(params)] = f"%{q}%"
-        params[len(params)+1] = f"%{q}%"
-        params[len(params)+2] = f"%{q}%"
-
-    if order == "score_desc":
-        order_by = "ORDER BY score DESC, COALESCE(posted_at,'') DESC"
-    elif order == "date_desc":
-        order_by = "ORDER BY COALESCE(posted_at,'') DESC, score DESC"
-    else:
-        order_by = "ORDER BY updated_at DESC"
-
-    sql = "SELECT id,title,company,location,remote,url,source,posted_at,pulled_at,description,score FROM jobs"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += f" {order_by} LIMIT ?"
-
-    with connect(db_path) as conn:
-        cur = conn.cursor()
-        args: List[Any] = []
-        if sources:
-            args.extend(sources)
-        # keep params in insertion order:
-        for i in range(len(params)):
-            args.append(params[i])
-        args.append(int(limit))
-        rows = cur.execute(sql, args).fetchall()
-
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        out.append({
-            "id": r[0], "title": r[1], "company": r[2], "location": r[3],
-            "remote": bool(r[4]), "url": r[5], "source": r[6],
-            "posted_at": r[7], "pulled_at": r[8], "description": r[9], "score": float(r[10]),
-        })
-    return out
-
-def prune_duplicates(db_path: Optional[str] = None) -> int:
-    """
-    Keep max(score) per hash_key; delete others.
-    Returns number of rows deleted.
-    """
-    init_db(db_path)
-    with connect(db_path) as conn:
-        cur = conn.cursor()
-        # Find worst ids per hash_key
-        cur.execute("""
-            WITH ranked AS (
-              SELECT id, hash_key, score,
-                     ROW_NUMBER() OVER (PARTITION BY hash_key ORDER BY score DESC, COALESCE(posted_at,'') DESC) AS rn
-              FROM jobs
-            )
-            SELECT id FROM ranked WHERE rn > 1
-        """)
-        to_del = [r[0] for r in cur.fetchall()]
-        if not to_del:
-            return 0
-        cur.executemany("DELETE FROM jobs WHERE id = ?", [(i,) for i in to_del])
-        conn.commit()
-        return len(to_del)
-
-# --- add to the DDL string (keep the semicolons structure) ---
+# Minimal runs table (used by history/reporting elsewhere)
 DDL = DDL + """
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,10 +103,237 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_runs_finished_at ON runs(finished_at);
 """
 
-# ---- Run logging helpers ----
-import json
-from typing import Optional
+def connect(db_path: Optional[str] = None) -> sqlite3.Connection:
+    path = db_path or DB_PATH
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
 
+def init_db(db_path: Optional[str] = None) -> None:
+    with connect(db_path) as conn:
+        for stmt in DDL.strip().split(";"):
+            s = stmt.strip()
+            if s:
+                conn.execute(s)
+
+# ---------------------------
+# Column helpers (for safe ALTERs)
+# ---------------------------
+def _table_has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return any(r[1] == col for r in cur.fetchall())
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, cols: list[tuple[str, str]]) -> None:
+    for name, decl in cols:
+        if not _table_has_column(conn, table, name):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    conn.commit()
+
+def _ensure_reports_columns(db_path: str | None = None) -> None:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(jobs)")
+        cols = {r[1] for r in cur.fetchall()}
+        alters = []
+        if "status" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN status TEXT")
+        if "status_notes" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN status_notes TEXT")
+        if "starred" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN starred INTEGER DEFAULT 0")
+        if "first_seen" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN first_seen TEXT")
+        if "last_seen" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN last_seen TEXT")
+        if "updated_at" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN updated_at TEXT")
+        # NEW: actionable/submission flags
+        if "not_suitable" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN not_suitable INTEGER DEFAULT 0")
+        if "submitted" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN submitted INTEGER DEFAULT 0")
+        if "submitted_at" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN submitted_at TEXT")
+        # NEW: resume columns (no-ops if already added elsewhere)
+        if "resume_path" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN resume_path TEXT")
+        if "resume_score" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN resume_score REAL")
+
+        for sql in alters:
+            cur.execute(sql)
+
+        # helpful indices
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_pulled_at   ON jobs(pulled_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at  ON jobs(created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at  ON jobs(updated_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_score       ON jobs(score)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status      ON jobs(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_submitted   ON jobs(submitted)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_not_suitable ON jobs(not_suitable)")
+        conn.commit()
+
+def _pick_id_column(conn: sqlite3.Connection, table: str = "jobs") -> str:
+    # Prefer 'job_id' if it exists; otherwise 'id'
+    return "job_id" if _table_has_column(conn, table, "job_id") else "id"
+
+# ---------------------------
+# Basic utils
+# ---------------------------
+def _coerce_bool(b) -> int:
+    return 1 if b in (True, "true", "True", 1) else 0
+
+def _hash_key(it: Dict[str, Any]) -> str:
+    company = (it.get("company") or "").strip().lower()
+    title = (it.get("title") or "").strip().lower()
+    url = (it.get("url") or "").strip().lower()
+    return f"{company}|{title}|{url}"
+
+# ---------- Danger-zone helpers ----------
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (name,),
+    ).fetchone()
+    return bool(row)
+
+def clear_jobs_data(db_path: Optional[str] = None, *, include_runs: bool = True, vacuum: bool = True) -> dict:
+    """
+    Delete all rows from jobs (and runs if include_runs=True), keeping the schema.
+    Returns counts: {"jobs_deleted": int, "runs_deleted": int}
+    """
+    init_db(db_path)
+    with connect(db_path) as conn:
+        jobs_deleted = 0
+        runs_deleted = 0
+
+        if _table_exists(conn, "jobs"):
+            (jobs_deleted,) = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
+            conn.execute("DELETE FROM jobs")
+
+        if include_runs and _table_exists(conn, "runs"):
+            (runs_deleted,) = conn.execute("SELECT COUNT(*) FROM runs").fetchone()
+            conn.execute("DELETE FROM runs")
+
+        conn.commit()
+        if vacuum:
+            # Reclaim disk space after large deletes
+            try:
+                conn.execute("VACUUM")
+            except Exception:
+                pass
+
+    return {"jobs_deleted": int(jobs_deleted), "runs_deleted": int(runs_deleted)}
+
+def nuke_database(db_path: Optional[str] = None) -> bool:
+    """
+    Hard reset: delete the SQLite file (and -wal/-shm siblings) and recreate schema.
+    Returns True on success.
+    """
+    path = db_path or DB_PATH
+    try:
+        # Ensure any on-disk file path
+        path = os.path.abspath(path)
+        # Close any stray connections by using a short-lived one first
+        try:
+            with connect(path):
+                pass
+        except Exception:
+            pass
+
+        # Remove main + WAL/SHM if present
+        for p in (path, path + "-wal", path + "-shm"):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                # On Windows a locked file can raise; bubble up as False
+                return False
+
+        # Recreate schema
+        init_db(path)
+        return True
+    except Exception:
+        return False
+
+# ---------------------------
+# Ingest / Upsert
+# ---------------------------
+def store_jobs(items: Iterable[Dict[str, Any]], db_path: Optional[str] = None) -> Dict[str, int]:
+    """
+    Upsert by id. Keeps first pulled_at; updates other fields.
+    Returns counts: {'inserted': X, 'updated': Y} (approximate).
+    """
+    init_db(db_path)
+    now = utcnow()
+    total = 0
+    with connect(db_path) as conn:
+        cur = conn.cursor()
+        for it in items:
+            total += 1
+            row = {
+                "id": it.get("id") or it.get("url"),
+                "title": it.get("title") or "",
+                "company": it.get("company") or "",
+                "location": it.get("location") or "",
+                "remote": _coerce_bool(it.get("remote")),
+                "url": it.get("url") or "",
+                "source": it.get("source") or "",
+                "posted_at": it.get("posted_at"),
+                "pulled_at": now,
+                "description": it.get("description") or "",
+                "score": float(it.get("score") or 0.0),
+                "hash_key": _hash_key(it),
+                "created_at": now,
+                "updated_at": now,
+            }
+            cur.execute("""
+            INSERT INTO jobs (id, title, company, location, remote, url, source, posted_at, pulled_at, description, score, hash_key, created_at, updated_at)
+            VALUES (:id,:title,:company,:location,:remote,:url,:source,:posted_at,:pulled_at,:description,:score,:hash_key,:created_at,:updated_at)
+            ON CONFLICT(id) DO UPDATE SET
+              title=excluded.title,
+              company=excluded.company,
+              location=excluded.location,
+              remote=excluded.remote,
+              url=excluded.url,
+              source=excluded.source,
+              posted_at=COALESCE(excluded.posted_at, jobs.posted_at),
+              description=excluded.description,
+              score=excluded.score,
+              hash_key=excluded.hash_key,
+              updated_at=excluded.updated_at
+            """, row)
+        conn.commit()
+    return {"inserted": total, "updated": 0}
+
+def prune_duplicates(db_path: Optional[str] = None) -> int:
+    """
+    Keep max(score) per hash_key; delete others. Returns number of rows deleted.
+    """
+    init_db(db_path)
+    with connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            WITH ranked AS (
+              SELECT id, hash_key, score,
+                     ROW_NUMBER() OVER (PARTITION BY hash_key ORDER BY score DESC, COALESCE(posted_at,'') DESC) AS rn
+              FROM jobs
+            )
+            SELECT id FROM ranked WHERE rn > 1
+        """)
+        to_del = [r[0] for r in cur.fetchall()]
+        if not to_del:
+            return 0
+        cur.executemany("DELETE FROM jobs WHERE id = ?", [(i,) for i in to_del])
+        conn.commit()
+        return len(to_del)
+
+# ---------------------------
+# Runs logging (used by history/reporting)
+# ---------------------------
 def _json_dumps_safe(obj) -> str:
     try:
         return json.dumps(obj, ensure_ascii=False)
@@ -263,29 +351,13 @@ def record_run(
     notes: Optional[str] = None,
     db_path: Optional[str] = None,
 ) -> int:
-    """
-    Persist a single fetch/scoring run to the `runs` table.
-
-    Compatible usage patterns:
-      A) record_run(res)                           # pass the whole hunt_jobs result dict
-      B) record_run(stats=..., params=..., ...)    # pass fields explicitly
-
-    Fields derived from `res` (if provided):
-      - finished_at  <- res['generated_at']
-      - item_count   <- res['count']
-      - source_count <- unique sources in res['items']
-      - stats        <- res['stats']
-      - params       <- {'use_embeddings':..., 'embedding_model':...} if present
-    """
     init_db(db_path)
 
-    # Derive from res, if provided
     items = []
     if isinstance(res, dict):
         finished_at = finished_at or res.get("generated_at")
         stats = stats or res.get("stats")
         items = res.get("items") or []
-        # pull a few common params if present
         params_from_res = {}
         for k in ("use_embeddings", "embedding_model", "ordering", "sources_yaml", "resume_path"):
             if k in res:
@@ -321,22 +393,19 @@ def record_run(
         conn.commit()
         return int(run_id)
 
-# Backward-compat alias (some older code used log_run)
 def log_run(*args, **kwargs) -> int:
     return record_run(*args, **kwargs)
 
 def list_runs(limit: int = 50, db_path: Optional[str] = None) -> list[dict]:
     init_db(db_path)
     with connect(db_path) as conn:
-        cur = conn.cursor()
-        rows = cur.execute(
+        rows = conn.execute(
             """
             SELECT id, started_at, finished_at, ok, source_count, item_count, notes, params_json, stats_json
             FROM runs
             ORDER BY COALESCE(finished_at, created_at) DESC
             LIMIT ?
-            """,
-            (int(limit),),
+            """, (int(limit),)
         ).fetchall()
     out = []
     for r in rows:
@@ -356,13 +425,11 @@ def list_runs(limit: int = 50, db_path: Optional[str] = None) -> list[dict]:
 def get_run(run_id: int, db_path: Optional[str] = None) -> Optional[dict]:
     init_db(db_path)
     with connect(db_path) as conn:
-        cur = conn.cursor()
-        r = cur.execute(
+        r = conn.execute(
             """
             SELECT id, started_at, finished_at, ok, source_count, item_count, notes, params_json, stats_json, created_at
             FROM runs WHERE id = ?
-            """,
-            (int(run_id),),
+            """, (int(run_id),)
         ).fetchone()
     if not r:
         return None
@@ -379,601 +446,82 @@ def get_run(run_id: int, db_path: Optional[str] = None) -> Optional[dict]:
         "created_at": r[9],
     }
 
-def query_new_since(
-    since,                         # datetime or ISO/string ("YYYY-MM-DD" OK)
-    sources: list[str] | None = None,
-    min_score: float | None = None,
-    limit: int = 500,
-    db_path: str | None = None,
-) -> list[dict]:
-    """
-    Return jobs first pulled after `since`.
-    - Filters by sources and min_score if provided.
-    - Ordered newest-first by pulled_at.
-    """
+# --- Action flags columns (not_suitable/submitted) ---
+def ensure_action_columns(db_path: str | None = None) -> None:
     init_db(db_path)
-    since_iso = _to_iso(since)
-    if not since_iso:
-        raise ValueError("query_new_since: `since` is required")
-
-    where = ["pulled_at > ?"]
-    params: list = [since_iso]
-
-    if sources:
-        placeholders = ",".join("?" for _ in sources)
-        where.append(f"source IN ({placeholders})")
-        params.extend(sources)
-
-    if min_score is not None:
-        where.append("score >= ?")
-        params.append(float(min_score))
-
-    sql = f"""
-        SELECT id, title, company, location, remote, url, source,
-               posted_at, pulled_at, description, score, hash_key,
-               created_at, updated_at
-        FROM jobs
-        WHERE {" AND ".join(where)}
-        ORDER BY pulled_at DESC
-        LIMIT ?
-    """
-    params.append(int(limit))
-
     with connect(db_path) as conn:
-        cur = conn.cursor()
-        rows = cur.execute(sql, params).fetchall()
+        cur = conn.execute("PRAGMA table_info(jobs)")
+        cols = {r[1] for r in cur.fetchall()}
 
-    cols = ["id","title","company","location","remote","url","source",
-            "posted_at","pulled_at","description","score","hash_key",
-            "created_at","updated_at"]
-    out: list[dict] = []
-    for r in rows:
-        item = {cols[i]: r[i] for i in range(len(cols))}
-        # tidy types
-        if item.get("remote") is not None:
-            item["remote"] = bool(item["remote"])
-        if item.get("score") is not None:
-            item["score"] = float(item["score"])
-        out.append(item)
-    return out
+        alters = []
+        if "not_suitable" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN not_suitable INTEGER DEFAULT 0")
+        if "not_suitable_at" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN not_suitable_at TEXT")
+        if "not_suitable_reasons" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN not_suitable_reasons TEXT")
+        if "not_suitable_note" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN not_suitable_note TEXT")
 
-# If you have a DDL string, append these lines to it.
-# Otherwise, execute these CREATE INDEX statements once during init_db().
-DDL = DDL + """
-CREATE INDEX IF NOT EXISTS idx_jobs_pulled_at ON jobs(pulled_at);
-CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source);
-"""
+        if "submitted" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN submitted INTEGER DEFAULT 0")
+        if "submitted_at" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN submitted_at TEXT")
 
-DDL = DDL + """
-CREATE INDEX IF NOT EXISTS idx_jobs_pulled_at  ON jobs(pulled_at);
-CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);
-CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at);
-CREATE INDEX IF NOT EXISTS idx_jobs_source     ON jobs(source);
-"""
+        # keep resume columns handy for the Generate page
+        if "resume_path" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN resume_path TEXT")
+        if "resume_score" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN resume_score REAL")
 
-# Speed up score-ordered queries and common filters
-DDL = DDL + """
-CREATE INDEX IF NOT EXISTS idx_jobs_score          ON jobs(score);
-CREATE INDEX IF NOT EXISTS idx_jobs_source_score   ON jobs(source, score);
-CREATE INDEX IF NOT EXISTS idx_jobs_company_title  ON jobs(company, title);
-"""
+        for sql in alters:
+            conn.execute(sql)
 
-
-def query_changed_since(
-    since,                         # datetime or ISO string ("YYYY-MM-DD" OK)
-    *,
-    sources: list[str] | None = None,
-    min_score: float | None = None,
-    include_new: bool = True,      # include rows created after `since`
-    limit: int = 500,
-    db_path: str | None = None,
-) -> list[dict]:
-    """
-    Return jobs that changed after `since`.
-    'Changed' is defined as having a change timestamp > since, where change timestamp is:
-        COALESCE(updated_at, pulled_at, created_at)
-
-    Args:
-      since: datetime or ISO string.
-      sources: optional list of source names to include.
-      min_score: optional minimum score filter.
-      include_new: if False, exclude rows whose created_at > since (i.e., only updates).
-      limit: max rows to return (newest changed first).
-    """
-    init_db(db_path)
-    since_iso = _to_iso(since)
-    if not since_iso:
-        raise ValueError("query_changed_since: `since` is required")
-
-    # Build WHERE
-    change_expr = "COALESCE(updated_at, pulled_at, created_at)"
-    where = [f"{change_expr} > ?"]
-    params: list = [since_iso]
-
-    if not include_new:
-        # Exclude newly created rows after since
-        where.append("created_at <= ?")
-        params.append(since_iso)
-
-    if sources:
-        placeholders = ",".join("?" for _ in sources)
-        where.append(f"source IN ({placeholders})")
-        params.extend(sources)
-
-    if min_score is not None:
-        where.append("score >= ?")
-        params.append(float(min_score))
-
-    sql = f"""
-        SELECT id, title, company, location, remote, url, source,
-               posted_at, pulled_at, description, score, hash_key,
-               created_at, updated_at
-        FROM jobs
-        WHERE {" AND ".join(where)}
-        ORDER BY {change_expr} DESC
-        LIMIT ?
-    """
-    params.append(int(limit))
-
-    with connect(db_path) as conn:
-        cur = conn.cursor()
-        rows = cur.execute(sql, params).fetchall()
-
-    cols = ["id","title","company","location","remote","url","source",
-            "posted_at","pulled_at","description","score","hash_key",
-            "created_at","updated_at"]
-    out: list[dict] = []
-    for r in rows:
-        item = {cols[i]: r[i] for i in range(len(cols))}
-        if item.get("remote") is not None:
-            item["remote"] = bool(item["remote"])
-        if item.get("score") is not None:
-            item["score"] = float(item["score"])
-        out.append(item)
-    return out
-
-def query_top_matches(
-    limit: int = 50,
-    *,
-    sources: list[str] | None = None,
-    min_score: float | None = None,
-    posted_start: str | None = None,   # ISO string or "YYYY-MM-DD" (uses _to_iso)
-    posted_end: str | None = None,     # ISO string or "YYYY-MM-DD"
-    q: str | None = None,              # substring match across title/company/description
-    dedupe: bool = True,               # keep best row per (company|title|url)
-    db_path: str | None = None,
-) -> list[dict]:
-    """
-    Return top-scoring jobs with optional filters. If `dedupe=True`, keeps only the
-    single highest-scored row per (company|title|url) cluster.
-
-    Ordered by: score DESC, then COALESCE(posted_at, pulled_at, created_at) DESC.
-    """
-    init_db(db_path)
-
-    where = []
-    params: list = []
-
-    if sources:
-        placeholders = ",".join("?" for _ in sources)
-        where.append(f"source IN ({placeholders})")
-        params.extend(sources)
-
-    if min_score is not None:
-        where.append("score >= ?")
-        params.append(float(min_score))
-
-    if posted_start:
-        where.append("(COALESCE(posted_at, pulled_at, created_at) >= ?)")
-        params.append(_to_iso(posted_start))
-
-    if posted_end:
-        where.append("(COALESCE(posted_at, pulled_at, created_at) <= ?)")
-        params.append(_to_iso(posted_end))
-
-    if q and q.strip():
-        like = f"%{q.strip()}%"
-        where.append("(title LIKE ? OR company LIKE ? OR description LIKE ?)")
-        params.extend([like, like, like])
-
-    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    order_sql = "ORDER BY score DESC, COALESCE(posted_at, pulled_at, created_at) DESC"
-
-    # If deduping, grab more than needed then prune in Python
-    fetch_cap = max(limit * 5, 200) if dedupe else limit
-
-    sql = f"""
-        SELECT id, title, company, location, remote, url, source,
-               posted_at, pulled_at, description, score, hash_key,
-               created_at, updated_at
-        FROM jobs
-        {where_sql}
-        {order_sql}
-        LIMIT ?
-    """
-    with connect(db_path) as conn:
-        cur = conn.cursor()
-        rows = cur.execute(sql, (*params, int(fetch_cap))).fetchall()
-
-    cols = ["id","title","company","location","remote","url","source",
-            "posted_at","pulled_at","description","score","hash_key",
-            "created_at","updated_at"]
-
-    def _row_to_dict(r):
-        d = {cols[i]: r[i] for i in range(len(cols))}
-        if d.get("remote") is not None:
-            d["remote"] = bool(d["remote"])
-        if d.get("score") is not None:
-            d["score"] = float(d["score"])
-        return d
-
-    items = [_row_to_dict(r) for r in rows]
-
-    if not dedupe:
-        return items[:limit]
-
-    # Python-side dedupe by (company|title|url) keeping best score
-    seen: dict[str, dict] = {}
-    for it in items:
-        key = ((it.get("company") or "").strip().lower() + "|" +
-               (it.get("title") or "").strip().lower() + "|" +
-               (it.get("url") or "").strip().lower())
-        prev = seen.get(key)
-        if prev is None or (it.get("score", 0.0) > prev.get("score", 0.0)):
-            seen[key] = it
-
-    deduped = list(seen.values())
-    deduped.sort(key=lambda x: (-x.get("score", 0.0), (x.get("posted_at") or x.get("pulled_at") or x.get("created_at") or "")), reverse=False)
-    return deduped[:limit]
-
-# --- load_latest: DB first, then JSON fallback ---
-import os, json
-from typing import Optional
-
-def _table_exists(conn, name: str) -> bool:
-    try:
-        cur = conn.cursor()
-        row = cur.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-            (name,),
-        ).fetchone()
-        return bool(row)
-    except Exception:
-        return False
-
-def load_latest(
-    limit: int = 500,
-    *,
-    prefer_db: bool = True,
-    db_path: Optional[str] = None,
-    json_path: str = "jobs_ranked.json",
-) -> dict:
-    """
-    Returns a dict like:
-      {
-        "items": [...],
-        "count": <int>,
-        "source": "db" | "json" | None,
-        "stats": { ... }     # if available from JSON
-      }
-
-    DB mode: returns newest by pulled_at (desc).
-    JSON mode: reads items from jobs_ranked.json (if present).
-    """
-    init_db(db_path)
-
-    # Try DB first
-    if prefer_db:
+        # If an older column exists, migrate its values into the new one once.
         try:
-            with connect(db_path) as conn:
-                if _table_exists(conn, "jobs"):
-                    cur = conn.cursor()
-                    rows = cur.execute(
-                        """
-                        SELECT id, title, company, location, remote, url, source,
-                               posted_at, pulled_at, description, score, hash_key,
-                               created_at, updated_at
-                        FROM jobs
-                        ORDER BY COALESCE(pulled_at, created_at) DESC
-                        LIMIT ?
-                        """,
-                        (int(limit),),
-                    ).fetchall()
-
-                    if rows:
-                        cols = ["id","title","company","location","remote","url","source",
-                                "posted_at","pulled_at","description","score","hash_key",
-                                "created_at","updated_at"]
-                        items = []
-                        for r in rows:
-                            d = {cols[i]: r[i] for i in range(len(cols))}
-                            if d.get("remote") is not None:
-                                d["remote"] = bool(d["remote"])
-                            if d.get("score") is not None:
-                                d["score"] = float(d["score"])
-                            items.append(d)
-                        return {"items": items, "count": len(items), "source": "db", "stats": {}}
+            if "not_suitable_reasons" in cols:
+                conn.execute("""
+                    UPDATE jobs
+                    SET not_suitable_reasons = COALESCE(not_suitable_reasons, not_suitable_reasons)
+                    WHERE not_suitable_reasons IS NOT NULL
+                      AND (not_suitable_reasons IS NULL OR TRIM(not_suitable_reasons) = '')
+                """)
         except Exception:
-            # fall back to JSON
+            # ignore if the old column doesn't exist in this DB
             pass
 
-    # Fallback: JSON file written by job_hunter CLI/UI
-    try:
-        if os.path.exists(json_path):
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            items = data.get("items") or []
-            items = items[: int(limit)]
-            return {
-                "items": items,
-                "count": len(items),
-                "source": "json",
-                "stats": (data.get("stats") or {}),
-            }
-    except Exception:
-        pass
-
-    return {"items": [], "count": 0, "source": None, "stats": {}}
-
-def save_latest(result: dict, json_path: str = "jobs_ranked.json") -> None:
-    """Persist the full result dict to JSON (for reports or offline review)."""
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
-# ====== JOB STATUS SUPPORT ======
-
-from datetime import datetime, timezone
-from typing import Optional
-
-# Valid states (feel free to tweak)
-ALLOWED_STATUSES = {
-    "new", "interested", "applied", "interview", "offer", "rejected", "archived"
-}
-
-def _to_iso(dt_or_str) -> Optional[str]:
-    """Accepts datetime or string and returns ISO-8601 (UTC) string."""
-    if dt_or_str is None:
-        return None
-    if isinstance(dt_or_str, datetime):
-        if dt_or_str.tzinfo is None:
-            dt_or_str = dt_or_str.replace(tzinfo=timezone.utc)
-        return dt_or_str.isoformat()
-    s = str(dt_or_str).strip()
-    if len(s) == 10 and s[4] == "-" and s[7] == "-":  # YYYY-MM-DD
-        return s + "T00:00:00+00:00"
-    return s
-
-def ensure_job_status_columns(db_path: Optional[str] = None) -> None:
-    """Ensure jobs table has status columns; create if missing."""
-    init_db(db_path)
-    with connect(db_path) as conn:
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(jobs)")
-        cols = {r[1] for r in cur.fetchall()}
-        alters = []
-        if "status" not in cols:
-            alters.append("ALTER TABLE jobs ADD COLUMN status TEXT")
-        if "status_notes" not in cols:
-            alters.append("ALTER TABLE jobs ADD COLUMN status_notes TEXT")
-        if "status_updated_at" not in cols:
-            alters.append("ALTER TABLE jobs ADD COLUMN status_updated_at TEXT")
-        if "starred" not in cols:
-            alters.append("ALTER TABLE jobs ADD COLUMN starred INTEGER DEFAULT 0")
-        for sql in alters:
-            cur.execute(sql)
-        # Helpful index
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_not_suitable ON jobs(not_suitable)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_submitted     ON jobs(submitted)")
         conn.commit()
 
-def set_job_status(
-    *,
-    id: Optional[int] = None,
-    url: Optional[str] = None,
-    hash_key: Optional[str] = None,
-    status: Optional[str] = None,
-    notes: Optional[str] = None,
-    starred: Optional[bool] = None,
-    db_path: Optional[str] = None,
-    allow_new_status_values: bool = False,
-) -> dict:
-    """
-    Update status/notes/starred for a job identified by id OR url OR hash_key.
-    Returns: {"updated": <int>, "job": <dict|None>}
-    """
-    ensure_job_status_columns(db_path)
-
-    if id is None and url is None and hash_key is None:
-        raise ValueError("set_job_status: provide one identifier (id, url, or hash_key).")
-    if status is None and notes is None and starred is None:
-        raise ValueError("set_job_status: nothing to update.")
-
-    if (status is not None) and (not allow_new_status_values) and (status not in ALLOWED_STATUSES):
-        raise ValueError(f"Invalid status '{status}'. Allowed: {sorted(ALLOWED_STATUSES)}")
-
-    now = utcnow()
-    sets, params = [], []
-    # If any field changes, bump status_updated_at
-    touch_timestamp = False
-
-    if status is not None:
-        sets.append("status = ?")
-        params.append(status)
-        touch_timestamp = True
-
-    if notes is not None:
-        sets.append("status_notes = ?")
-        params.append(notes)
-        touch_timestamp = True
-
-    if starred is not None:
-        sets.append("starred = ?")
-        params.append(1 if starred else 0)
-        touch_timestamp = True
-
-    if touch_timestamp:
-        sets.append("status_updated_at = ?")
-        params.append(now)
-
-    where, wparams = [], []
-    if id is not None:
-        where.append("id = ?"); wparams.append(int(id))
-    if url is not None:
-        where.append("url = ?"); wparams.append(url)
-    if hash_key is not None:
-        where.append("hash_key = ?"); wparams.append(hash_key)
-    where_sql = " OR ".join(where)
-
-    with connect(db_path) as conn:
-        cur = conn.cursor()
-        cur.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE {where_sql}", (*params, *wparams))
-        affected = cur.rowcount
-        conn.commit()
-
-        job = None
-        if affected:
-            row = cur.execute(
-                f"""SELECT id, title, company, location, remote, url, source,
-                           posted_at, pulled_at, description, score, hash_key,
-                           created_at, updated_at, status, status_notes,
-                           status_updated_at, starred
-                    FROM jobs
-                    WHERE {where_sql}
-                    LIMIT 1""",
-                tuple(wparams),
-            ).fetchone()
-            if row:
-                cols = ["id","title","company","location","remote","url","source",
-                        "posted_at","pulled_at","description","score","hash_key",
-                        "created_at","updated_at","status","status_notes",
-                        "status_updated_at","starred"]
-                job = {cols[i]: row[i] for i in range(len(cols))}
-                if job.get("remote") is not None:
-                    job["remote"] = bool(job["remote"])
-                if job.get("score") is not None:
-                    job["score"] = float(job["score"])
-                if job.get("starred") is not None:
-                    job["starred"] = bool(job["starred"])
-
-    return {"updated": affected, "job": job}
-
-def query_by_status(
-    statuses: Optional[list[str]] = None,
-    *,
-    starred: Optional[bool] = None,
-    limit: int = 500,
-    db_path: Optional[str] = None,
-) -> list[dict]:
-    """Fetch jobs by status and/or starred flag, newest status change first."""
-    ensure_job_status_columns(db_path)
-
-    where, params = [], []
-    if statuses:
-        placeholders = ",".join("?" for _ in statuses)
-        where.append(f"status IN ({placeholders})")
-        params.extend(statuses)
-    if starred is not None:
-        where.append("starred = ?")
-        params.append(1 if starred else 0)
-
-    sql = """
-        SELECT id, title, company, location, remote, url, source,
-               posted_at, pulled_at, description, score, hash_key,
-               created_at, updated_at, status, status_notes,
-               status_updated_at, starred
-        FROM jobs
-    """
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY COALESCE(status_updated_at, pulled_at, created_at) DESC LIMIT ?"
-    params.append(int(limit))
-
-    with connect(db_path) as conn:
-        cur = conn.cursor()
-        rows = cur.execute(sql, params).fetchall()
-
-    cols = ["id","title","company","location","remote","url","source",
-            "posted_at","pulled_at","description","score","hash_key",
-            "created_at","updated_at","status","status_notes",
-            "status_updated_at","starred"]
-    out = []
-    for r in rows:
-        d = {cols[i]: r[i] for i in range(len(cols))}
-        if d.get("remote") is not None:
-            d["remote"] = bool(d["remote"])
-        if d.get("score") is not None:
-            d["score"] = float(d["score"])
-        if d.get("starred") is not None:
-            d["starred"] = bool(d["starred"])
-        out.append(d)
-    return out
-
-# ==============================
-# COMPAT SHIM FOR 02_Job_Reports.py
-# ==============================
-from datetime import datetime, timedelta, timezone
-
-# --- ensure extra columns the report expects ---
-def _ensure_reports_columns(db_path: str | None = None) -> None:
-    init_db(db_path)
-    with connect(db_path) as conn:
-        cur = conn.cursor()
-        cur.execute("PRAGMA table_info(jobs)")
-        cols = {r[1] for r in cur.fetchall()}
-        alters = []
-        if "status" not in cols:
-            alters.append("ALTER TABLE jobs ADD COLUMN status TEXT")
-        if "status_notes" not in cols:
-            alters.append("ALTER TABLE jobs ADD COLUMN status_notes TEXT")
-        if "starred" not in cols:
-            alters.append("ALTER TABLE jobs ADD COLUMN starred INTEGER DEFAULT 0")
-        if "first_seen" not in cols:
-            alters.append("ALTER TABLE jobs ADD COLUMN first_seen TEXT")
-        if "last_seen" not in cols:
-            alters.append("ALTER TABLE jobs ADD COLUMN last_seen TEXT")
-        if "updated_at" not in cols:
-            alters.append("ALTER TABLE jobs ADD COLUMN updated_at TEXT")
-        for sql in alters:
-            cur.execute(sql)
-        # helpful indices
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_pulled_at  ON jobs(pulled_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_score      ON jobs(score)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status     ON jobs(status)")
-        conn.commit()
-
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-def _to_iso_compat(s: str) -> str:
-    if not s:
-        return _now_iso()
-    s = s.strip().replace("Z", "+00:00")
-    # allow "24h", "7d" style too
-    try:
-        if s.endswith("h"):
-            hrs = float(s[:-1]); return (datetime.now(timezone.utc) - timedelta(hours=hrs)).isoformat()
-        if s.endswith("d"):
-            days = float(s[:-1]); return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    except Exception:
-        pass
-    try:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.isoformat()
-    except Exception:
-        return _now_iso()
+# ---------------------------
+# Report query helpers
+# ---------------------------
+# Standard column list all report queries will SELECT (order matters)
+REPORT_COLS = [
+    "id","title","company","location","remote","url","source",
+    "posted_at","pulled_at","description","score","hash_key",
+    "created_at","updated_at","status","status_notes","starred",
+    "first_seen","last_seen","resume_path","resume_score"
+]
 
 def _row_to_report_dict(row) -> dict:
     """
     Map DB row -> report dict keys the page expects.
+    Safe with SELECTs that don't include all columns (we guard with len(row)).
     """
-    cols = ["id","title","company","location","remote","url","source",
-            "posted_at","pulled_at","description","score","hash_key",
-            "created_at","updated_at","status","status_notes","starred",
-            "first_seen","last_seen"]
-    d = {cols[i]: row[i] for i in range(len(cols)) if i < len(row)}
+    cols = [
+        "id","title","company","location","remote","url","source",
+        "posted_at","pulled_at","description","score","hash_key",
+        "created_at","updated_at","status","status_notes","starred",
+        "first_seen","last_seen",
+        # New (will be present if SELECT includes them)
+        "resume_path","resume_score",
+        "not_suitable","not_suitable_at",
+        "not_suitable_reasons","unsuitable_reason_note",
+        "submitted","submitted_at",
+    ]
+    d = {cols[i]: row[i] for i in range(min(len(cols), len(row)))}
     # normalize types/aliases
     d["job_id"] = d.pop("id", None)
     d["user_notes"] = d.get("status_notes")
@@ -982,19 +530,17 @@ def _row_to_report_dict(row) -> dict:
     if d.get("remote") is not None:
         d["remote"] = bool(d["remote"])
     if d.get("starred") is not None:
-        d["starred"] = int(d["starred"])
+        try: d["starred"] = int(d["starred"])
+        except Exception: pass
     if d.get("score") is not None:
         try: d["score"] = float(d["score"])
         except Exception: pass
     return d
 
-# --- keep first_seen/last_seen reasonably fresh on upsert/store ---
-def _touch_seen_rows(db_path: str | None = None):
+def _touch_seen_rows(db_path: Optional[str] = None):
     _ensure_reports_columns(db_path)
     with connect(db_path) as conn:
-        cur = conn.cursor()
-        # If first_seen is null, set to created_at or pulled_at
-        cur.execute("""
+        conn.execute("""
             UPDATE jobs
             SET first_seen = COALESCE(first_seen, created_at, pulled_at),
                 last_seen  = COALESCE(last_seen,  pulled_at, updated_at, created_at)
@@ -1002,25 +548,12 @@ def _touch_seen_rows(db_path: str | None = None):
         """)
         conn.commit()
 
-# Call this opportunistically from your store function if you want:
-# _touch_seen_rows(db_path)
-
-# ------------------------------
-# load_latest(db_path, limit)
-# ------------------------------
-def load_latest(db_path: str | None = None, limit: int = 20):
-    """
-    Reports page expects: list[dict] newest-first by pulled_at/created_at.
-    """
+def load_latest(db_path: Optional[str] = None, limit: int = 20):
     _ensure_reports_columns(db_path)
     with connect(db_path) as conn:
-        cur = conn.cursor()
-        rows = cur.execute(
-            """
-            SELECT id, title, company, location, remote, url, source,
-                   posted_at, pulled_at, description, score, hash_key,
-                   created_at, updated_at, status, status_notes, starred,
-                   first_seen, last_seen
+        rows = conn.execute(
+            f"""
+            SELECT {", ".join(REPORT_COLS)}
             FROM jobs
             ORDER BY COALESCE(pulled_at, created_at) DESC
             LIMIT ?
@@ -1029,49 +562,82 @@ def load_latest(db_path: str | None = None, limit: int = 20):
         ).fetchall()
     return [_row_to_report_dict(r) for r in rows]
 
-# ------------------------------
-# query_top_matches(db_path, ...)
-# ------------------------------
 def query_top_matches(db_path: str | None = None, *, limit: int = 50,
                       min_score: float = 0.0, hide_stale_days: int | None = None):
-    """
-    Simplified: top by score desc; optional staleness filter.
-    """
     _ensure_reports_columns(db_path)
-    where = ["score >= ?"]
-    params = [float(min_score)]
-    if hide_stale_days:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=int(hide_stale_days))).isoformat()
-        where.append("COALESCE(pulled_at, created_at) >= ?")
-        params.append(cutoff)
-    sql = f"""
-        SELECT id, title, company, location, remote, url, source,
-               posted_at, pulled_at, description, score, hash_key,
-               created_at, updated_at, status, status_notes, starred,
-               first_seen, last_seen
-        FROM jobs
-        WHERE {" AND ".join(where)}
-        ORDER BY score DESC, COALESCE(posted_at, pulled_at, created_at) DESC
-        LIMIT ?
-    """
-    params.append(int(limit))
+    ensure_action_columns(db_path) 
     with connect(db_path) as conn:
         cur = conn.cursor()
+        where = ["score >= ?"]
+        params = [float(min_score)]
+        if hide_stale_days:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=int(hide_stale_days))).isoformat()
+            where.append("COALESCE(pulled_at, created_at) >= ?")
+            params.append(cutoff)
+        sql = f"""
+            SELECT id, title, company, location, remote, url, source,
+                posted_at, pulled_at, description, score, hash_key,
+                created_at, updated_at, status, status_notes, starred,
+                first_seen, last_seen,
+                resume_path, resume_score,
+                not_suitable, not_suitable_at,
+                not_suitable_reasons,
+                submitted, submitted_at
+            FROM jobs
+            WHERE {" AND ".join(where)}
+            ORDER BY score DESC, COALESCE(posted_at, pulled_at, created_at) DESC
+            LIMIT ?
+        """
+        params.append(int(limit))
         rows = cur.execute(sql, params).fetchall()
-    return [_row_to_report_dict(r) for r in rows]
 
-# ------------------------------
-# query_new_since(db_path, since_iso, ...)
-# ------------------------------
-def query_new_since(db_path: str | None,
+    cols = ["id","title","company","location","remote","url","source",
+            "posted_at","pulled_at","description","score","hash_key",
+            "created_at","updated_at","status","status_notes","starred",
+            "first_seen","last_seen","resume_path","resume_score",
+            "not_suitable","not_suitable_at",
+            "not_suitable_reasons",
+            "submitted","submitted_at"]
+
+    out = []
+    for r in rows:
+        d = {cols[i]: r[i] for i in range(len(cols))}
+        d["job_id"] = d.pop("id", None)
+        d["user_notes"] = d.get("status_notes")
+        d["first_seen"] = d.get("first_seen") or d.get("created_at") or d.get("pulled_at")
+        d["last_seen"]  = d.get("last_seen")  or d.get("pulled_at")   or d.get("updated_at") or d.get("created_at")
+        if d.get("remote") is not None:
+            d["remote"] = bool(d["remote"])
+        if d.get("starred") is not None:
+            d["starred"] = int(d["starred"])
+        if d.get("score") is not None:
+            try: d["score"] = float(d["score"])
+            except Exception: pass
+        if d.get("resume_score") is not None:
+            try: d["resume_score"] = float(d["resume_score"])
+            except Exception: pass
+        if d.get("not_suitable") is not None:
+            d["not_suitable"] = int(d["not_suitable"])
+        if d.get("not_suitable_at") is not None:
+            d["not_suitable_at"] = d["not_suitable_at"]
+        if d.get("not_suitable_reasons") is not None:
+            d["not_suitable_reasons"] = d["not_suitable_reasons"]
+        if d.get("unsuitable_reason_note") is not None:
+            d["unsuitable_reason_note"] = d["unsuitable_reason_note"]
+        if d.get("submitted") is not None:
+            d["submitted"] = int(d["submitted"])
+        if d.get("submitted_at") is not None:
+            d["submitted_at"] = d["submitted_at"]
+        out.append(d)
+
+    return out
+
+def query_new_since(db_path: Optional[str],
                     since_iso: str,
                     *,
                     min_score: float = 0.0,
-                    hide_stale_days: int | None = None,
+                    hide_stale_days: Optional[int] = None,
                     limit: int = 100):
-    """
-    New rows first pulled after `since_iso` (or created after).
-    """
     _ensure_reports_columns(db_path)
     since_iso = _to_iso_compat(since_iso)
     where = [
@@ -1083,12 +649,8 @@ def query_new_since(db_path: str | None,
         cutoff = (datetime.now(timezone.utc) - timedelta(days=int(hide_stale_days))).isoformat()
         where.append("COALESCE(pulled_at, created_at) >= ?")
         params.append(cutoff)
-
     sql = f"""
-        SELECT id, title, company, location, remote, url, source,
-               posted_at, pulled_at, description, score, hash_key,
-               created_at, updated_at, status, status_notes, starred,
-               first_seen, last_seen
+        SELECT {", ".join(REPORT_COLS)}
         FROM jobs
         WHERE {" AND ".join(where)}
         ORDER BY COALESCE(pulled_at, created_at) DESC
@@ -1096,34 +658,20 @@ def query_new_since(db_path: str | None,
     """
     params.append(int(limit))
     with connect(db_path) as conn:
-        cur = conn.cursor()
-        rows = cur.execute(sql, params).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     return [_row_to_report_dict(r) for r in rows]
 
-# ------------------------------
-# query_changed_since(db_path, since_iso, ...)
-# ------------------------------
-def query_changed_since(db_path: str | None,
+def query_changed_since(db_path: Optional[str],
                         since_iso: str,
                         *,
                         limit: int = 200):
-    """
-    We don't have a historical change log table here, so we approximate:
-    return any job with COALESCE(updated_at, pulled_at, created_at) > since,
-    and emit a single 'seen' event per job for the report.
-    """
     _ensure_reports_columns(db_path)
     since_iso = _to_iso_compat(since_iso)
     change_expr = "COALESCE(updated_at, pulled_at, created_at)"
     with connect(db_path) as conn:
-        cur = conn.cursor()
-        rows = cur.execute(
+        rows = conn.execute(
             f"""
-            SELECT id, title, company, location, remote, url, source,
-                   posted_at, pulled_at, description, score, hash_key,
-                   created_at, updated_at, status, status_notes, starred,
-                   first_seen, last_seen,
-                   {change_expr} as changed_at
+            SELECT {", ".join(REPORT_COLS)}, {change_expr} as changed_at
             FROM jobs
             WHERE {change_expr} > ?
             ORDER BY changed_at DESC
@@ -1134,11 +682,12 @@ def query_changed_since(db_path: str | None,
 
     events = []
     for r in rows:
-        d = _row_to_report_dict(r[:-1])  # map first N cols
+        core = r[:-1]  # everything except changed_at
+        d = _row_to_report_dict(core)
         changed_at = r[-1]
         events.append({
             "changed_at": changed_at,
-            "field": "seen",          # placeholder without full diff history
+            "field": "seen",
             "old_value": "",
             "new_value": changed_at,
             "title": d.get("title",""),
@@ -1153,33 +702,411 @@ def query_changed_since(db_path: str | None,
         })
     return events
 
-# ------------------------------
-# set_job_status(db_path, job_id, ...)
-# ------------------------------
-def set_job_status(db_path: str | None,
+# ---------------------------
+# Status API used by reports page
+# ---------------------------
+ALLOWED_STATUSES = {"new","interested","applied","interview","offer","rejected","archived"}
+
+def set_job_status(db_path: Optional[str],
                    job_id: int,
                    *,
-                   status: str | None = None,
-                   user_notes: str | None = None,
-                   starred: bool | None = None) -> bool:
-    """
-    Update status/notes/starred for a job (report page signature).
-    """
+                   status: Optional[str] = None,
+                   user_notes: Optional[str] = None,
+                   starred: Optional[bool] = None) -> bool:
     _ensure_reports_columns(db_path)
-    now = _now_iso()
+    now = utcnow()
+    sets, params = [], []
+    if status is not None:
+        if status not in ALLOWED_STATUSES:
+            raise ValueError(f"Invalid status '{status}'. Allowed: {sorted(ALLOWED_STATUSES)}")
+        sets.append("status = ?"); params.append(status)
+        sets.append("status_updated_at = ?"); params.append(now)
+    if user_notes is not None:
+        sets.append("status_notes = ?"); params.append(user_notes)
+        # bump timestamp if only notes changed
+        if "status_updated_at = ?" not in sets:
+            sets.append("status_updated_at = ?"); params.append(now)
+    if starred is not None:
+        sets.append("starred = ?"); params.append(1 if starred else 0)
+        if "status_updated_at = ?" not in sets:
+            sets.append("status_updated_at = ?"); params.append(now)
+    if not sets:
+        return False
+    sets.append("updated_at = ?"); params.append(now)
+
     with connect(db_path) as conn:
         cur = conn.cursor()
-        sets, params = [], []
-        if status is not None:
-            sets.append("status = ?"); params.append(status)
-        if user_notes is not None:
-            sets.append("status_notes = ?"); params.append(user_notes)
-        if starred is not None:
-            sets.append("starred = ?"); params.append(1 if starred else 0)
-        if not sets:
-            return False
-        sets.append("updated_at = ?"); params.append(now)
-        params.append(int(job_id))
-        cur.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", params)
+        cur.execute(f"UPDATE jobs SET {', '.join(sets)} WHERE id = ?", (*params, int(job_id)))
         conn.commit()
         return cur.rowcount > 0
+
+# ---------------------------
+# Resume path / score persistence (used by 04_Generate_From_Jobs)
+# ---------------------------
+import sqlite3
+
+def _get_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return {r[1] for r in cur.fetchall()}
+
+def _ensure_resume_columns(conn: sqlite3.Connection):
+    cols = _get_columns(conn, "jobs")
+    if "resume_path" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN resume_path TEXT")
+    if "resume_score" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN resume_score REAL")
+    conn.commit()
+
+def _update_by_any_key(conn: sqlite3.Connection, job_key: str, sets_sql: str, params: tuple) -> int:
+    cols = _get_columns(conn, "jobs")
+    id_col = "job_id" if "job_id" in cols else "id"
+    cur = conn.execute(f"UPDATE jobs SET {sets_sql} WHERE {id_col} = ?", (*params, job_key))
+    if cur.rowcount == 0 and isinstance(job_key, str) and job_key.startswith(("http://", "https://")):
+        cur = conn.execute(f"UPDATE jobs SET {sets_sql} WHERE url = ?", (*params, job_key))
+    conn.commit()
+    return cur.rowcount
+
+def set_job_resume(
+    db_path: str,
+    *,
+    job_key: str | None = None,
+    resume_path: str | None = None,
+    resume_score: float | None = None,
+    **kwargs
+) -> bool:
+    # Back-compat: allow callers to pass job_id=
+    if not job_key:
+        job_key = kwargs.get("job_id")
+    if not db_path or not job_key:
+        return False
+
+    with sqlite3.connect(db_path) as conn:
+        _ensure_resume_columns(conn)
+        changed = _update_by_any_key(conn, job_key, "resume_path = ?, resume_score = ?", (resume_path, resume_score))
+        return changed > 0
+
+def _ensure_action_columns(conn: sqlite3.Connection):
+    cols = _get_columns(conn, "jobs")
+    q = []
+    if "not_suitable" not in cols:
+        q.append("ALTER TABLE jobs ADD COLUMN not_suitable INTEGER DEFAULT 0")
+    if "submitted" not in cols:
+        q.append("ALTER TABLE jobs ADD COLUMN submitted INTEGER DEFAULT 0")
+    if "submitted_at" not in cols:
+        q.append("ALTER TABLE jobs ADD COLUMN submitted_at TEXT")
+    for sql in q:
+        conn.execute(sql)
+    conn.commit()
+
+def set_job_not_suitable(
+    db_path: str,
+    *,
+    job_key: str | None = None,
+    **kwargs
+) -> bool:
+    if not job_key:
+        job_key = kwargs.get("job_id")  # back-compat
+    if not db_path or not job_key:
+        return False
+    with sqlite3.connect(db_path) as conn:
+        _ensure_action_columns(conn)
+        changed = _update_by_any_key(conn, job_key, "not_suitable = 1", tuple())
+        return changed > 0
+
+def set_job_submitted(
+    db_path: str,
+    *,
+    job_key: str | None = None,
+    submitted: bool = True,
+    submitted_at: str | None = None,
+    **kwargs
+) -> bool:
+    if not job_key:
+        job_key = kwargs.get("job_id")  # back-compat
+    if not db_path or not job_key:
+        return False
+    if submitted and not submitted_at:
+        submitted_at = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(db_path) as conn:
+        _ensure_action_columns(conn)
+        if submitted:
+            sets = "submitted = 1, submitted_at = ?"
+            params = (submitted_at,)
+        else:
+            sets = "submitted = 0, submitted_at = NULL"
+            params = tuple()
+        changed = _update_by_any_key(conn, job_key, sets, params)
+        return changed > 0
+
+def query_submitted(db_path: str | None = None, *, limit: int = 500) -> list[dict]:
+    _ensure_reports_columns(db_path)
+    with connect(db_path) as conn:
+        cur = conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT id, title, company, location, remote, url, source,
+                   posted_at, pulled_at, description, score, hash_key,
+                   created_at, updated_at, status, status_notes, starred,
+                   first_seen, last_seen,
+                   resume_path, resume_score,
+                   not_suitable, not_suitable_at,
+                   not_suitable_reasons, unsuitable_reason_note,
+                   submitted, submitted_at
+            FROM jobs
+            WHERE submitted = 1
+            ORDER BY COALESCE(submitted_at, updated_at, pulled_at, created_at) DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+
+    cols = ["id","title","company","location","remote","url","source",
+            "posted_at","pulled_at","description","score","hash_key",
+            "created_at","updated_at","status","status_notes","starred",
+            "first_seen","last_seen","resume_path","resume_score",
+            "not_suitable","not_suitable_at","not_suitable_reasons",
+            "unsuitable_reason_note","submitted","submitted_at"]
+
+    out = []
+    for r in rows:
+        d = {cols[i]: r[i] for i in range(len(cols))}
+        d["job_id"] = d.pop("id", None)
+        if d.get("remote") is not None:
+            d["remote"] = bool(d["remote"])
+        if d.get("starred") is not None:
+            d["starred"] = int(d["starred"])
+        if d.get("score") is not None:
+            try: d["score"] = float(d["score"])
+            except Exception: pass
+        if d.get("resume_score") is not None:
+            try: d["resume_score"] = float(d["resume_score"])
+            except Exception: pass
+        if d.get("not_suitable") is not None:
+            d["not_suitable"] = bool(d["not_suitable"])
+        if d.get("not_suitable_at") is not None:
+            d["not_suitable_at"] = d["not_suitable_at"]
+        if d.get("not_suitable_reasons") is not None:
+            d["not_suitable_reasons"] = d["not_suitable_reasons"]
+        if d.get("unsuitable_reason_note") is not None:
+            d["unsuitable_reason_note"] = d["unsuitable_reason_note"]
+        if d.get("submitted") is not None:
+            d["submitted"] = bool(d["submitted"])
+        if d.get("submitted_at") is not None:
+            d["submitted_at"] = d["submitted_at"]
+        out.append(d)
+    return out
+
+# ===== Preference / Training columns (flags + reasons) =====
+
+def ensure_preference_columns(db_path: Optional[str] = None) -> None:
+    """Ensure jobs table has columns needed for suitability & submission tracking."""
+    init_db(db_path)
+    with connect(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(jobs)")
+        cols = {r[1] for r in cur.fetchall()}
+        alters = []
+        if "not_suitable" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN not_suitable INTEGER DEFAULT 0")
+        if "not_suitable_at" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN not_suitable_at TEXT")
+        if "not_suitable_reasons" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN not_suitable_reasons TEXT")
+        if "unsuitable_reason_note" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN unsuitable_reason_note TEXT")
+        if "submitted" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN submitted INTEGER DEFAULT 0")
+        if "submitted_at" not in cols:
+            alters.append("ALTER TABLE jobs ADD COLUMN submitted_at TEXT")
+        for sql in alters:
+            cur.execute(sql)
+        # Helpful indices
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_not_suitable ON jobs(not_suitable)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_jobs_submitted    ON jobs(submitted)")
+        conn.commit()
+
+def _where_by_job_key(conn: sqlite3.Connection, job_key: str) -> tuple[str, list]:
+    cur = conn.execute("PRAGMA table_info(jobs)")
+    cols = {r[1] for r in cur.fetchall()}
+    wh, params = [], []
+    if "job_id" in cols:
+        wh.append("job_id = ?"); params.append(job_key)
+    wh.append("id = ?"); params.append(job_key)
+    wh.append("url = ?"); params.append(job_key)
+    return " OR ".join(wh), params
+
+def mark_not_suitable(db_path: str, job_id: str, *, reasons=None, note: str | None = None) -> bool:
+    ensure_action_columns(db_path)
+    ts = utcnow()
+    reasons_json = json.dumps(reasons or [])
+    with connect(db_path) as conn:
+        where_sql, wparams = _where_by_job_key(conn, job_id)
+        sql = f"""
+            UPDATE jobs
+            SET not_suitable = 1,
+                not_suitable_at = ?,
+                not_suitable_reasons = ?,
+                not_suitable_note = ?,
+                updated_at = COALESCE(updated_at, ?)
+            WHERE {where_sql}
+        """
+        cur = conn.execute(sql, (ts, reasons_json, (note or ""), ts, *wparams))
+        conn.commit()
+        return cur.rowcount > 0
+
+def mark_submitted(db_path: str, job_id: str, *, submitted: bool = True, submitted_at: str | None = None) -> bool:
+    ensure_action_columns(db_path)
+    ts = submitted_at or utcnow()
+    with connect(db_path) as conn:
+        where_sql, wparams = _where_by_job_key(conn, job_id)
+        if submitted:
+            set_clause = "submitted = 1, submitted_at = ?, updated_at = COALESCE(updated_at, ?)"
+            params = (ts, ts, *wparams)
+        else:
+            set_clause = "submitted = 0, submitted_at = NULL, updated_at = COALESCE(updated_at, ?)"
+            params = (ts, *wparams)
+        sql = f"UPDATE jobs SET {set_clause} WHERE {where_sql}"
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return cur.rowcount > 0
+
+# optional aliases to keep older imports working
+set_job_not_suitable = mark_not_suitable
+set_job_submitted    = mark_submitted
+
+def query_submitted(db_path: str, *, limit: int = 500) -> list[dict]:
+    ensure_action_columns(db_path)
+    with connect(db_path) as conn:
+        cur = conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT id, title, company, location, remote, url, source,
+                   posted_at, pulled_at, description, score, hash_key,
+                   created_at, updated_at,
+                   submitted, submitted_at,
+                   resume_path, resume_score,
+                   not_suitable, not_suitable_at
+            FROM jobs
+            WHERE submitted = 1
+            ORDER BY COALESCE(submitted_at, updated_at, pulled_at, created_at) DESC
+            LIMIT ?
+            """, (int(limit),)
+        ).fetchall()
+    cols = ["id","title","company","location","remote","url","source",
+            "posted_at","pulled_at","description","score","hash_key",
+            "created_at","updated_at",
+            "submitted","submitted_at",
+            "resume_path","resume_score",
+            "not_suitable","not_suitable_at"]
+    out = []
+    for r in rows:
+        d = {cols[i]: r[i] for i in range(len(cols))}
+        if d.get("remote") is not None: d["remote"] = bool(d["remote"])
+        if d.get("submitted") is not None: d["submitted"] = bool(d["submitted"])
+        if d.get("not_suitable") is not None: d["not_suitable"] = bool(d["not_suitable"])
+        if d.get("score") is not None:
+            try: d["score"] = float(d["score"])
+            except Exception: pass
+        return out + [d]
+
+set_job_not_suitable = mark_not_suitable
+set_job_submitted    = mark_submitted
+
+# ---- Legacy/utility query: wide, filterable job list ----
+from typing import List, Dict, Any, Optional
+
+def query_jobs(
+    db_path: Optional[str] = None,
+    sources: Optional[List[str]] = None,
+    min_score: float = 0.0,
+    posted_start: Optional[str] = None,   # ISO or "YYYY-MM-DD"
+    posted_end: Optional[str] = None,     # ISO or "YYYY-MM-DD"
+    q: Optional[str] = None,              # substring across title/company/description
+    limit: int = 500,
+    order: str = "score_desc",            # "score_desc" | "date_desc" | "updated_desc"
+) -> List[Dict[str, Any]]:
+    """
+    Return jobs with simple server-side filters. This is a compatibility wrapper
+    used by pages like 03_job_history.py.
+
+    Ordering:
+      - score_desc:   score DESC, posted_at DESC
+      - date_desc:    posted_at DESC, score DESC
+      - updated_desc: updated_at DESC
+    """
+    init_db(db_path)
+
+    where_sql = []
+    params: list[Any] = []
+
+    if sources:
+        ph = ",".join(["?"] * len(sources))
+        where_sql.append(f"source IN ({ph})")
+        params.extend(sources)
+
+    if min_score is not None and float(min_score) > 0.0:
+        where_sql.append("score >= ?")
+        params.append(float(min_score))
+
+    if posted_start:
+        where_sql.append("COALESCE(posted_at, pulled_at, created_at) >= ?")
+        params.append(_to_iso(posted_start))
+
+    if posted_end:
+        where_sql.append("COALESCE(posted_at, pulled_at, created_at) <= ?")
+        params.append(_to_iso(posted_end))
+
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        where_sql.append("(title LIKE ? OR company LIKE ? OR description LIKE ?)")
+        params.extend([like, like, like])
+
+    where_clause = (" WHERE " + " AND ".join(where_sql)) if where_sql else ""
+
+    if order == "date_desc":
+        order_by = "ORDER BY COALESCE(posted_at, pulled_at, created_at) DESC, score DESC"
+    elif order == "updated_desc":
+        order_by = "ORDER BY COALESCE(updated_at, pulled_at, created_at) DESC"
+    else:
+        order_by = "ORDER BY score DESC, COALESCE(posted_at, pulled_at, created_at) DESC"
+
+    sql = f"""
+        SELECT id, title, company, location, remote, url, source,
+               posted_at, pulled_at, description, score, hash_key,
+               created_at, updated_at,
+               status, status_notes, starred,
+               first_seen, last_seen
+        FROM jobs
+        {where_clause}
+        {order_by}
+        LIMIT ?
+    """
+    params.append(int(limit))
+
+    with connect(db_path) as conn:
+        cur = conn.cursor()
+        rows = cur.execute(sql, params).fetchall()
+
+    cols = ["id","title","company","location","remote","url","source",
+            "posted_at","pulled_at","description","score","hash_key",
+            "created_at","updated_at","status","status_notes","starred",
+            "first_seen","last_seen"]
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = {cols[i]: r[i] for i in range(len(cols))}
+        # normalize types
+        d["remote"] = bool(d.get("remote")) if d.get("remote") is not None else None
+        if d.get("starred") is not None:
+            d["starred"] = int(d["starred"])
+        if d.get("score") is not None:
+            try: d["score"] = float(d["score"])
+            except Exception: pass
+        # compat aliases used by some pages
+        d["job_id"] = d.get("id")
+        d["user_notes"] = d.get("status_notes")
+        d["first_seen"] = d.get("first_seen") or d.get("created_at") or d.get("pulled_at")
+        d["last_seen"]  = d.get("last_seen")  or d.get("pulled_at")   or d.get("updated_at") or d.get("created_at")
+        out.append(d)
+
+    return out

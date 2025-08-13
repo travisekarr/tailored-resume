@@ -3,17 +3,22 @@ since: 24h
 min_score: 0.15
 hide_stale_days: 14
 search: ""
-top_count: 15
+top_count: 50
 new_limit: 100
 changed_limit: 200
+resume_save_dir: kept_resumes   # <— NEW
 filters:
   title_contains: ""
   company_contains: ""
   location_contains: ""
   description_contains: ""
-  sources: ["greenhouse","lever"]
+  use_location_allowlist: true
+  allowed_locations: ["USA", "VA", "North America", "Remote", "Worldwide"]
+  allow_empty_location: true
   remote_only: true
   posted_after: ""
   changed_fields: ["title","description_sha","score"]
   statuses: ["saved","interested","applied"]  # show these by default
   starred_only: false
+  sources: []
+
