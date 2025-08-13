@@ -22,18 +22,21 @@ def main():
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
-    res = hunt_jobs(
-        resume_path=args.resume,
-        sources_yaml=args.sources,
-        use_embeddings=args.use_embeddings,
-        embedding_model=args.embedding_model,
-        debug=args.debug,
-    )
-    if res["count"]:
-        info = store_jobs(res["items"])
-        print(f"[scheduled_fetch] Stored {res['count']} jobs (inserted/updated approx: {info['inserted']}/{info['updated']})")
-    else:
-        print("[scheduled_fetch] 0 jobs this run.")
+    try:
+        res = hunt_jobs(
+            resume_path=args.resume,
+            sources_yaml=args.sources,
+            use_embeddings=args.use_embeddings,
+            embedding_model=args.embedding_model,
+            debug=args.debug,
+        )
+        if res["count"]:
+            info = store_jobs(res["items"])
+            print(f"[scheduled_fetch] Stored {res['count']} jobs (inserted/updated approx: {info['inserted']}/{info['updated']})")
+        else:
+            print("[scheduled_fetch] 0 jobs this run.")
+    except Exception as e:
+        print(f"Error in scheduled fetch: {e}")
 
 if __name__ == "__main__":
     main()

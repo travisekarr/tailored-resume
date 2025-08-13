@@ -19,19 +19,30 @@ from sklearn.metrics.pairwise import cosine_similarity
 try:
     from openai import OpenAI
     _openai_client = OpenAI()
-except Exception:
+except Exception as e:
+    print(f"Error importing OpenAI: {e}")
     _openai_client = None
 
 # Optional content extractors (graceful fallback)
 try:
     import trafilatura
-except Exception:
+except Exception as e:
+    print(f"Error importing trafilatura: {e}")
     trafilatura = None
 
 try:
     from bs4 import BeautifulSoup
-except Exception:
+except Exception as e:
+    print(f"Error importing BeautifulSoup: {e}")
     BeautifulSoup = None
+
+import html as _html
+import math as _math
+try:
+    import tiktoken as _tiktoken  # optional, improves token estimates if installed
+except Exception as e:
+    print(f"Error importing tiktoken: {e}")
+    _tiktoken = None
 
 # -----------------------------
 # Utilities & logging
@@ -120,12 +131,14 @@ def load_sources_yaml(path: str, debug: bool = False) -> Tuple[Optional[dict], L
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read()
     except Exception as e:
+        print(f"Error reading YAML file: {e}")
         errs.append(f"read_error: {e}")
         return None, errs
 
     try:
         data = yaml.safe_load(raw) or {}
     except Exception as e:
+        print(f"Error parsing YAML: {e}")
         errs.append(f"yaml_parse_error: {e}")
         return None, errs
 
@@ -156,7 +169,8 @@ def _build_resume_text(resume_yaml_path: str) -> str:
     try:
         with open(resume_yaml_path, "r", encoding="utf-8") as f:
             sections = _y.safe_load(f)
-    except Exception:
+    except Exception as e:
+        print(f"Error reading resume YAML: {e}")
         return ""
     if not isinstance(sections, list):
         return ""
@@ -188,10 +202,10 @@ def _build_resume_text(resume_yaml_path: str) -> str:
     for s in sections:
         try:
             buf.append(_sec_text(s))
-        except Exception:
+        except Exception as e:
+            print(f"Error processing resume section: {e}")
             continue
     return " ".join(buf)
-
 
 # -----------------------------
 # Scoring helpers
@@ -219,18 +233,6 @@ def _score_tfidf(resume_text: str, job_texts: list[str]) -> list[float]:
     sims = cosine_similarity(tfidf[0:1], tfidf[1:]).flatten()
     return [float(x) for x in sims]
 
-def _score_embeddings(job_texts: List[str], embedding_model: str, resume_text: str) -> List[float]:
-    if _openai_client is None:
-        return [0.0] * len(job_texts)
-    inputs = [resume_text] + job_texts
-    resp = _openai_client.embeddings.create(model=embedding_model, input=inputs)
-    resume_vec = resp.data[0].embedding
-    scores: List[float] = []
-    for row in resp.data[1:]:
-        scores.append(_cosine(resume_vec, row.embedding))
-    return scores
-
-
 # -----------------------------
 # RSS helper
 # -----------------------------
@@ -239,6 +241,7 @@ def fetch_rss(feed_url: str, source: str, logs: list) -> List[dict]:
     try:
         f = feedparser.parse(feed_url)
     except Exception as e:
+        print(f"Error parsing RSS feed: {e}")
         _log(logs, "rss.parse_error", {"url": feed_url, "error": str(e)})
         return []
     out: List[dict] = []
@@ -265,13 +268,29 @@ def fetch_rss(feed_url: str, source: str, logs: list) -> List[dict]:
         })
     return out
 
-# --- add near the other imports ---
-import html as _html
-import math as _math
-try:
-    import tiktoken as _tiktoken  # optional, improves token estimates if installed
-except Exception:
-    _tiktoken = None
+
+def _log_openai_usage_resp(resp, *, endpoint: str, model: str, context: str = "cli", db_path: str | None = None):
+    try:
+        from job_store import log_api_usage
+        # Chat/Responses usage fields differ; Embeddings has .usage.total_tokens
+        usage = getattr(resp, "usage", None)
+        if usage:
+            # embeddings: input tokens are counted as total_tokens
+            itok = getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None) or getattr(usage, "total_tokens", None)
+            otok = getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None) or 0
+            ttok = getattr(usage, "total_tokens", None) or ((itok or 0) + (otok or 0))
+        else:
+            itok = getattr(resp, "usage", {}).get("total_tokens", 0) if isinstance(resp.__dict__.get("usage"), dict) else 0
+            otok, ttok = 0, itok
+        req_id = getattr(resp, "id", "") or getattr(resp, "request_id", "") or ""
+        log_api_usage(
+            db_path=db_path, endpoint=endpoint, model=model,
+            input_tokens=itok or 0, output_tokens=otok or 0, total_tokens=ttok or 0,
+            request_id=req_id, context=context, meta={}
+        )
+    except Exception as e:
+        print(f"Error logging OpenAI usage: {e}")
+        pass
 
 # ---------- Embedding batching helpers ----------
 # Safe budgets; tweak down if you still see "max_tokens_per_request"
@@ -279,7 +298,6 @@ _EMBED_REQ_TOKEN_BUDGET = 250_000      # per request (below the 300k hard cap)
 _MAX_CHARS_PER_INPUT   = 8_000         # ~2k tokens (roughly 4 chars/token); trims very long JDs
 
 # If you already have a global OpenAI client named _openai_client in this file, we reuse it.
-
 
 def _estimate_tokens(text: str, model: str = "text-embedding-3-small") -> int:
     """Rough token estimate. Uses tiktoken if available, falls back to 4 chars/token."""
@@ -337,10 +355,11 @@ def _cosine_sim(vec_a, vec_b) -> float:
     db = _math.sqrt(sum(b*b for b in vec_b))
     return (num / (da * db)) if da and db else 0.0
 
-
-def _score_embeddings(resume_text: str,
-                      job_texts: list[str],
-                      embedding_model: str = "text-embedding-3-small") -> list[float]:
+def _score_embeddings(
+    resume_text: str,
+    job_texts: list[str],
+    embedding_model: str = "text-embedding-3-small",
+) -> list[float]:
     """
     Robust embedding-based scoring:
       - cleans & trims each input
@@ -348,49 +367,48 @@ def _score_embeddings(resume_text: str,
       - embeds jobs in token-budgeted batches
       - returns cosine similarity scores aligned to job_texts order
     """
+    if _openai_client is None:
+        # OpenAI client not available → no-op scores
+        return [0.0] * len(job_texts)
+
     # 1) Clean & trim
     resume_clean = _clean_for_embedding(resume_text or "")
     jobs_clean   = [_clean_for_embedding(t or "") for t in job_texts]
 
-    # 2) Embed resume once
-    res = _openai_client.embeddings.create(model=embedding_model, input=resume_clean)
+    # 2) Embed resume once (fallback if model is invalid for the org)
+    try:
+        res = _openai_client.embeddings.create(model=embedding_model, input=resume_clean)
+    except Exception as e:
+        print(f"Error embedding resume: {e}")
+        embedding_model = "text-embedding-3-small"
+        res = _openai_client.embeddings.create(model=embedding_model, input=resume_clean)
     resume_vec = res.data[0].embedding
 
-    # 3) Batch-embed jobs under safe token budget
-    scores: list[float] = []
-    # chunk respecting token budget
-    batches = _chunk_by_token_budget(jobs_clean, embedding_model, _EMBED_REQ_TOKEN_BUDGET)
+    # 3) Batch-embed jobs
+    try:
+        resp = _openai_client.embeddings.create(model=embedding_model, input=jobs_clean)
+        job_vecs = [d.embedding for d in resp.data]
+    except Exception as e:
+        print(f"Error embedding jobs: {e}")
+        # last-ditch retry with small model
+        resp = _openai_client.embeddings.create(model="text-embedding-3-small", input=jobs_clean)
+        job_vecs = [d.embedding for d in resp.data]
 
-    for batch in batches:
-        if not batch:
-            continue
-        try:
-            resp = _openai_client.embeddings.create(model=embedding_model, input=batch)
-        except Exception as e:
-            # If we still somehow hit max-tokens error, cut the batch further and retry once
-            # (very defensive; usually not needed because of the budget above)
-            if hasattr(e, "message") and "max_tokens_per_request" in str(e):
-                # halve the budget and retry this batch in smaller chunks
-                sub_batches = _chunk_by_token_budget(batch, embedding_model, max(50_000, _EMBED_REQ_TOKEN_BUDGET // 2))
-                for sub in sub_batches:
-                    sub_resp = _openai_client.embeddings.create(model=embedding_model, input=sub)
-                    for d in sub_resp.data:
-                        scores.append(_cosine_sim(resume_vec, d.embedding))
-                continue
-            # re-raise other errors
-            raise
+    # 4) Cosine similarities
+    def _cos(a, b):
+        num = sum(x*y for x, y in zip(a, b))
+        da = sum(x*x for x in a) ** 0.5
+        db = sum(y*y for y in b) ** 0.5
+        return (num / (da * db)) if da and db else 0.0
 
-        for d in resp.data:
-            scores.append(_cosine_sim(resume_vec, d.embedding))
+    scores = [_cos(resume_vec, v) for v in job_vecs]
 
-    # 4) Ensure length alignment (should match len(job_texts))
+    # 5) Length alignment
     if len(scores) != len(job_texts):
-        # pad or trim just in case
         if len(scores) < len(job_texts):
             scores += [0.0] * (len(job_texts) - len(scores))
         else:
             scores = scores[:len(job_texts)]
-
     return scores
 
 # -----------------------------
@@ -421,6 +439,7 @@ def fetch_remoteok(cfg: dict, logs: list) -> List[dict]:
                     "description": it.get("description") or "",
                 })
         except Exception as e:
+            print(f"Error parsing remoteok data: {e}")
             _log(logs, "remoteok.parse_error", {"error": str(e)})
     return results
 
@@ -455,6 +474,7 @@ def fetch_remotive(cfg: dict, logs: list) -> List[dict]:
                                 "description": it.get("description") or "",
                             })
                     except Exception as e:
+                        print(f"Error parsing remotive data: {e}")
                         _log(logs, "remotive.parse_error", {"error": str(e)})
         else:
             r, _ = _http_get(base_url, logs)
@@ -475,6 +495,7 @@ def fetch_remotive(cfg: dict, logs: list) -> List[dict]:
                             "description": it.get("description") or "",
                         })
                 except Exception as e:
+                    print(f"Error parsing remotive data: {e}")
                     _log(logs, "remotive.parse_error", {"error": str(e)})
     return results[:limit]
 
@@ -489,6 +510,7 @@ def fetch_weworkremotely(cfg: dict, logs: list) -> List[dict]:
         try:
             f = feedparser.parse(u)
         except Exception as e:
+            print(f"Error parsing weworkremotely RSS: {e}")
             _log(logs, "rss.parse_error", {"url": u, "error": str(e), "source": "weworkremotely"})
             continue
 
@@ -566,6 +588,7 @@ def fetch_jobicy(cfg: dict, logs: list) -> List[dict]:
                     "description": it.get("jobDescription") or it.get("description") or "",
                 })
         except Exception as e:
+            print(f"Error parsing jobicy data: {e}")
             _log(logs, "jobicy.parse_error", {"error": str(e)})
     return out
 
@@ -597,6 +620,7 @@ def fetch_arbeitnow(cfg: dict, logs: list) -> List[dict]:
                     "description": it.get("description") or "",
                 })
         except Exception as e:
+            print(f"Error parsing arbeitnow data: {e}")
             _log(logs, "arbeitnow.parse_error", {"error": str(e)})
         page += 1
     return out
@@ -640,6 +664,7 @@ def fetch_usajobs(cfg: dict, logs: list) -> List[dict]:
                     "description": pos.get("UserArea", {}).get("Details", {}).get("JobSummary",""),
                 })
         except Exception as e:
+            print(f"Error parsing usajobs data: {e}")
             _log(logs, "usajobs.parse_error", {"error": str(e)})
     return out
 
@@ -682,6 +707,7 @@ def fetch_adzuna(cfg: dict, logs: list) -> List[dict]:
                     "description": it.get("description") or "",
                 })
         except Exception as e:
+            print(f"Error parsing adzuna data: {e}")
             _log(logs, "adzuna.parse_error", {"error": str(e)})
     return out
 
@@ -719,6 +745,7 @@ def fetch_jooble(cfg: dict, logs: list) -> List[dict]:
                     "description": it.get("snippet") or "",
                 })
         except Exception as e:
+            print(f"Error parsing jooble data: {e}")
             _log(logs, "jooble.parse_error", {"error": str(e)})
     return out
 
@@ -751,6 +778,7 @@ def fetch_themuse(cfg: dict, logs: list) -> List[dict]:
                     "description": it.get("contents") or "",
                 })
         except Exception as e:
+            print(f"Error parsing themuse data: {e}")
             _log(logs, "themuse.parse_error", {"error": str(e)})
     return out
 
@@ -782,6 +810,7 @@ def fetch_findwork(cfg: dict, logs: list) -> List[dict]:
                     "description": it.get("text") or "",
                 })
         except Exception as e:
+            print(f"Error parsing findwork data: {e}")
             _log(logs, "findwork.parse_error", {"error": str(e)})
     return out
 
@@ -811,6 +840,7 @@ def fetch_greenhouse(cfg: dict, logs: list) -> List[dict]:
                         "description": "",  # can be enriched later
                     })
             except Exception as e:
+                print(f"Error parsing greenhouse data for {comp}: {e}")
                 _log(logs, "greenhouse.parse_error", {"company": comp, "error": str(e)})
     return out
 
@@ -839,6 +869,7 @@ def fetch_lever(cfg: dict, logs: list) -> List[dict]:
                         "description": (it.get("descriptionPlain") or ""),
                     })
             except Exception as e:
+                print(f"Error parsing lever data for {comp}: {e}")
                 _log(logs, "lever.parse_error", {"company": comp, "error": str(e)})
     return out
 
@@ -870,6 +901,7 @@ def fetch_workable(cfg: dict, logs: list) -> List[dict]:
                         "description": "",  # can enrich
                     })
             except Exception as e:
+                print(f"Error parsing workable data for {acc}: {e}")
                 _log(logs, "workable.parse_error", {"account": acc, "error": str(e)})
     return out
 
@@ -899,6 +931,7 @@ def fetch_smartrecruiters(cfg: dict, logs: list) -> List[dict]:
                         "description": "",
                     })
             except Exception as e:
+                print(f"Error parsing smartrecruiters data for {comp}: {e}")
                 _log(logs, "smartrecruiters.parse_error", {"company": comp, "error": str(e)})
     return out
 
@@ -927,6 +960,7 @@ def fetch_recruitee(cfg: dict, logs: list) -> List[dict]:
                         "description": it.get("description") or "",
                     })
             except Exception as e:
+                print(f"Error parsing recruitee data for {comp}: {e}")
                 _log(logs, "recruitee.parse_error", {"company": comp, "error": str(e)})
     return out
 
@@ -958,6 +992,7 @@ def fetch_personio(cfg: dict, logs: list) -> List[dict]:
                         "description": it.get("description") or "",
                     })
             except Exception as e:
+                print(f"Error parsing personio data for {dom}: {e}")
                 _log(logs, "personio.parse_error", {"domain": dom, "error": str(e)})
     return out
 
@@ -1001,6 +1036,7 @@ def _fetch_with_trafilatura(url: str, logs: list, timeout: int, user_agent: Opti
         if extracted:
             return extracted.strip()
     except Exception as e:
+        print(f"Error fetching with trafilatura: {e}")
         _log(logs, "enrich.trafilatura.error", {"url": url, "error": str(e)})
     return None
 
@@ -1013,6 +1049,7 @@ def _fetch_with_bs4(url: str, logs: list, timeout: int, user_agent: Optional[str
             return None
         return _strip_tags_to_text(r.text)
     except Exception as e:
+        print(f"Error fetching with bs4: {e}")
         _log(logs, "enrich.request.error", {"url": url, "error": str(e)})
         return None
 
@@ -1077,7 +1114,8 @@ def _extract_resume_keywords(resume_yaml_path: str) -> set[str]:
     try:
         with open(resume_yaml_path, "r", encoding="utf-8") as f:
             sections = _y.safe_load(f) or []
-    except Exception:
+    except Exception as e:
+        print(f"Error extracting resume keywords: {e}")
         sections = []
     for sec in sections if isinstance(sections, list) else []:
         if isinstance(sec, dict):
@@ -1150,6 +1188,7 @@ def probe_sources(sources_yaml: str, debug: bool = False) -> List[dict]:
             r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             rows.append({"when": utcnow(), "tag": f"probe.{name}", "status": r.status_code, "reason": getattr(r, "reason", None), "url": url})
         except Exception as e:
+            print(f"Error probing source {name}: {e}")
             rows.append({"when": utcnow(), "tag": f"probe.{name}", "status": None, "reason": str(e)})
     return rows
 
@@ -1169,6 +1208,7 @@ def hunt_jobs(
     cfg, errs = load_sources_yaml(sources_yaml, debug=debug)
     if errs:
         for e in errs:
+            print(f"Error validating YAML: {e}")
             _log(logs, "yaml.validation_error", {"error": e})
         return {
             "generated_at": utcnow(),
@@ -1233,6 +1273,7 @@ def hunt_jobs(
             else:
                 _log(logs, "aggregator.unknown", {"name": name})
         except Exception as e:
+            print(f"Error fetching jobs from aggregator {name}: {e}")
             _log(logs, "aggregator.error", {"name": name, "error": str(e)})
 
     raw_total = len(items)
@@ -1346,6 +1387,7 @@ def hunt_jobs(
     if logger:
         try:
             logger("hunt_jobs.complete", res)
-        except Exception:
+        except Exception as e:
+            print(f"Error calling logger in hunt_jobs: {e}")
             pass
     return res

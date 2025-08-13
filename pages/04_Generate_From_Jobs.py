@@ -4,102 +4,122 @@ import re
 import traceback
 import urllib.parse
 from io import BytesIO
-from datetime import datetime, timezone  # ← added
-
+from datetime import datetime, timezone
+import streamlit as st
 import yaml
 import pandas as pd
-import streamlit as st
+from dotenv import load_dotenv
 from jinja2 import Environment, FileSystemLoader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from openai import OpenAI
+from resume_semantic_scoring_engine import load_resume, generate_tailored_resume
 
-from dotenv import load_dotenv
-from openai import OpenAI  # only used if you enable GPT rephrasing
 
-from resume_semantic_scoring_engine import (
-    load_resume,
-    generate_tailored_resume,
-)
-
+# Core job DB helpers
 from job_store import (
     query_top_matches,
     set_job_status,
     set_job_resume,
-    mark_not_suitable,   # NEW
-    mark_submitted,      # NEW
-    query_submitted,     # NEW
+    log_api_usage,            # usage logging
 )
 
-# --- NEW: soft imports for new actions/tables (works even if your job_store
-#          hasn't been updated yet; buttons will show but be no-ops)
+# Optional actions (graceful if missing in job_store)
 try:
-    from job_store import set_job_not_suitable as _set_job_not_suitable
+    from job_store import mark_not_suitable as _mark_not_suitable_db
 except Exception:
-    _set_job_not_suitable = None
+    _mark_not_suitable_db = None
 try:
-    from job_store import set_job_submitted as _set_job_submitted
+    from job_store import mark_submitted as _mark_submitted_db
 except Exception:
-    _set_job_submitted = None
+    _mark_submitted_db = None
 try:
-    from job_store import query_submitted as _query_submitted
+    from job_store import query_submitted as _query_submitted_db
 except Exception:
-    _query_submitted = None
-
-# After: _openai_client = OpenAI()
-def _build_gpt_model_options(client) -> list[str]:
-    # Preferred order: newest first
-    preferred = ["gpt-5.0", "gpt-5o", "gpt-4.1", "gpt-4o", "gpt-4", "gpt-3.5-turbo"]
-    try:
-        models = client.models.list()
-        have = {m.id for m in getattr(models, "data", [])}
-        opts = [m for m in preferred if m in have]
-        # If we can’t list models or none of the preferred are visible, show the list anyway.
-        return opts or preferred
-    except Exception:
-        return preferred
-    
-def _mark_not_suitable(db_path: str, job_id: str, reasons=None, note=None) -> bool:
-    return mark_not_suitable(db_path, job_id, reasons=reasons, note=note)
-
-def _mark_submitted(db_path: str, job_key: str) -> bool:
-    if callable(_set_job_submitted):
-        now_iso = datetime.now(timezone.utc).isoformat()
-        return _set_job_submitted(db_path=db_path, job_key=job_key, submitted=True, submitted_at=now_iso)
-    return False
-
-def _list_submitted(db_path: str, limit: int = 500) -> list[dict]:
-    if callable(_query_submitted):
-        return _query_submitted(db_path=db_path, limit=limit)
-    return []
-
-UNSUITABLE_REASON_CHOICES = [
-    "location/onsite",
-    "seniority_mismatch",
-    "tech_stack_mismatch",
-    "domain_mismatch",
-    "clearance_or_citizenship",
-    "visa_sponsorship",
-    "compensation",
-    "contract_type",
-    "schedule",
-    "culture_or_values",
-    "spam_or_duplicate",
-    "other",
-]
+    _query_submitted_db = None
 
 # ==============================
 # CONFIG
 # ==============================
 RESUME_PATH = "modular_resume_full.yaml"
 TEMPLATE_FILE = "tailored_resume_template.html"
-DEFAULTS_PATH = "report_defaults.yaml"  # reuse the same defaults used by Jobs Report
+DEFAULTS_PATH = "report_defaults.yaml"
+MODEL_SETTINGS_PATH = "api_models.yaml"   # <- unified model settings YAML
 
 # Environment / OpenAI
 load_dotenv()
 _openai_client = OpenAI()  # safe if key missing; we gate GPT usage behind toggles
 
+
 # ==============================
-# Defaults loader (same shape used in 02_jobs_report), now with resume_save_dir
+# Model settings (YAML-driven)
+# ==============================
+_MODEL_FALLBACK = {
+    "models": {
+        "chat": {
+            "default": "gpt-5.0",
+            "options": [
+                {"id": "gpt-5.0", "display": "GPT 5.0 (Thinking)"},
+                {"id": "gpt-5o",  "display": "GPT-5o"},
+                {"id": "gpt-4.1", "display": "GPT-4.1"},
+                {"id": "gpt-4o",  "display": "GPT-4o"},
+                {"id": "gpt-4",   "display": "GPT-4"},
+                {"id": "gpt-3.5-turbo", "display": "GPT-3.5 Turbo"},
+            ],
+        },
+        "embeddings": {
+            "default": "text-embedding-3-small",
+            "options": [
+                {"id": "text-embedding-3-small", "display": "Text Embedding 3 Small"},
+                {"id": "text-embedding-3-large", "display": "Text Embedding 3 Large"},
+            ],
+        },
+    }
+}
+
+def _load_model_settings(path: str = MODEL_SETTINGS_PATH) -> dict:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            # minimal validation
+            if "models" in data and "chat" in data["models"] and "embeddings" in data["models"]:
+                return data
+    except Exception:
+        pass
+    return _MODEL_FALLBACK
+
+def _model_selectbox(label: str, group: str, *, key: str, disabled: bool = False):
+    """
+    Render a selectbox using YAML-backed model options.
+    Stores the selected **model id** in session (so the rest of the code can
+    pass it directly to OpenAI). Displays the **display** label.
+    """
+    settings = _load_model_settings()
+    grp = settings["models"][group]
+    opts = grp.get("options", [])
+    default_id = grp.get("default") or (opts[0]["id"] if opts else "")
+    ids = [o["id"] for o in opts]
+    id_to_label = {o["id"]: o.get("display", o["id"]) for o in opts}
+
+    def _fmt(x): return id_to_label.get(x, x)
+    try:
+        default_idx = ids.index(default_id) if default_id in ids else 0
+    except Exception:
+        default_idx = 0
+
+    return st.selectbox(
+        label,
+        ids,
+        index=default_idx,
+        key=key,
+        disabled=disabled,
+        format_func=_fmt,
+    )
+
+
+# ==============================
+# Defaults loader (same shape as Jobs Report), with resume_save_dir
 # ==============================
 DEFAULTS_FALLBACK = {
     "db": "jobs.db",
@@ -110,19 +130,18 @@ DEFAULTS_FALLBACK = {
     "top_count": 15,
     "new_limit": 100,
     "changed_limit": 200,
-    "resume_save_dir": "kept_resumes",   # <— NEW DEFAULT
+    "resume_save_dir": "kept_resumes",
     "filters": {
         "title_contains": "",
         "company_contains": "",
         "location_contains": "",
         "description_contains": "",
-        "sources": [],          # e.g. ["greenhouse","lever","rss"]
+        "sources": [],
         "remote_only": False,
         "posted_after": "",
         "changed_fields": [],
         "statuses": [],
         "starred_only": False,
-        # Location allowlist
         "use_location_allowlist": True,
         "allowed_locations": ["USA", "VA", "North America", "Remote", "Worldwide"],
         "allow_empty_location": True,
@@ -140,6 +159,7 @@ def load_defaults(path=DEFAULTS_PATH):
         merged["resume_save_dir"] = "kept_resumes"
     return merged
 
+
 # ==============================
 # Persistent state
 # ==============================
@@ -151,6 +171,7 @@ if "gen_cache" not in st.session_state:
 
 def log(msg: str):
     st.session_state.gen_debug.append(str(msg))
+
 
 # ==============================
 # Helpers: extraction, formatting, scoring
@@ -203,7 +224,6 @@ def tfidf_score(a_text: str, b_text: str) -> float:
     return float(sim or 0.0)
 
 def path_to_file_url(path: str) -> str:
-    """Return a file:// URL that browsers may open (may be blocked by some browsers)."""
     abs_path = os.path.abspath(path).replace("\\", "/")
     return "file:///" + urllib.parse.quote(abs_path, safe="/:._-")
 
@@ -256,16 +276,8 @@ def apply_saved_filters(rows: list[dict], fdefs: dict) -> list[dict]:
     return out
 
 def make_arrow_friendly(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize column dtypes so Streamlit -> Arrow is happy.
-    - id/job_id → string
-    - all date/time-ish columns → string
-    - numeric scores → float
-    - everything else object→string to avoid mixed types
-    """
     if df is None or df.empty:
         return df
-
     for col in df.columns:
         low = col.lower()
         if low in ("id", "job_id"):
@@ -276,10 +288,31 @@ def make_arrow_friendly(df: pd.DataFrame) -> pd.DataFrame:
         elif low in ("score", "resume_score"):
             df[col] = pd.to_numeric(df[col], errors="coerce")
         else:
-            # normalize object columns to string to avoid mixed object types
             if df[col].dtype == "object":
                 df[col] = df[col].astype("string")
     return df
+
+def _log_chat_usage(resp, model: str, context: str):
+    try:
+        u = resp.usage
+        it = getattr(u, "prompt_tokens", None) or getattr(u, "input_tokens", None) or 0
+        ot = getattr(u, "completion_tokens", None) or getattr(u, "output_tokens", None) or 0
+        tt = getattr(u, "total_tokens", None) or (it + ot)
+        rid = getattr(resp, "id", "") or getattr(resp, "request_id", "")
+        log_api_usage(
+            db_path=st.session_state.get("gen_db_path") or "jobs.db",
+            endpoint="chat.completions",
+            model=model,
+            input_tokens=int(it or 0),
+            output_tokens=int(ot or 0),
+            total_tokens=int(tt or 0),
+            request_id=rid,
+            context=context,
+            meta={}
+        )
+    except Exception:
+        pass
+
 
 # ==============================
 # Strict rephrase helpers (optional GPT)
@@ -341,16 +374,35 @@ Do NOT introduce any new facts, numbers, or achievements.
 Outline:
 {outline}
 """
-    resp = _openai_client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You rewrite text concisely without adding facts. Preserve placeholders exactly."},
-            {"role": "user", "content": prompt.strip()},
-        ],
-        max_tokens=180,
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content.strip()
+    try:
+        resp = _openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You rewrite text concisely without adding facts. Preserve placeholders exactly."},
+                {"role": "user", "content": prompt.strip()},
+            ],
+            max_tokens=180,
+            temperature=0.2,
+        )
+        _log_chat_usage(resp, model, "ui:04_Generate_From_Jobs:summary")
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        if "invalid model" in str(e).lower():
+            fallback = "gpt-4o"
+            st.warning(f"Model '{model}' not available; using {fallback} instead.")
+            resp = _openai_client.chat.completions.create(
+                model=fallback,
+                messages=[
+                    {"role": "system", "content": "You rewrite text concisely without adding facts. Preserve placeholders exactly."},
+                    {"role": "user", "content": prompt.strip()},
+                ],
+                max_tokens=180,
+                temperature=0.2,
+            )
+            _log_chat_usage(resp, fallback, "ui:04_Generate_From_Jobs:summary")
+            return resp.choices[0].message.content.strip()
+        # Any other error: just return the offline outline
+        return outline
 
 def _substitute_placeholders(text, title, years_exp, skills_str, achievement):
     subs = {
@@ -388,7 +440,7 @@ Original:
 {bullet}
 """
     try:
-        resp = _openai_client.chat_completions.create(  # fallback if your client exposes .chat_completions
+        resp = _openai_client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "You rephrase text concisely without adding facts. Obey constraints exactly."},
@@ -397,12 +449,15 @@ Original:
             temperature=0.2,
             max_tokens=120,
         )
+        _log_chat_usage(resp, model, "ui:04_Generate_From_Jobs:bullets")
         text = resp.choices[0].message.content.strip()
         return re.sub(r"\s+", " ", text)
-    except Exception:
-        try:
+    except Exception as e:
+        if "invalid model" in str(e).lower():
+            fallback = "gpt-4o"
+            st.warning(f"Model '{model}' not available; using {fallback} instead.")
             resp = _openai_client.chat.completions.create(
-                model=model,
+                model=fallback,
                 messages=[
                     {"role": "system", "content": "You rephrase text concisely without adding facts. Obey constraints exactly."},
                     {"role": "user", "content": prompt.strip()},
@@ -410,10 +465,11 @@ Original:
                 temperature=0.2,
                 max_tokens=120,
             )
+            _log_chat_usage(resp, fallback, "ui:04_Generate_From_Jobs:bullets")
             text = resp.choices[0].message.content.strip()
             return re.sub(r"\s+", " ", text)
-        except Exception:
-            return bullet
+        # Any other error → keep original bullet
+        return bullet
 
 def maybe_paraphrase_experience_bullets(sections, job_description, use_gpt: bool, model: str):
     if not use_gpt:
@@ -422,22 +478,20 @@ def maybe_paraphrase_experience_bullets(sections, job_description, use_gpt: bool
     out = []
     for sec in sections:
         if sec.get("type") != "experience":
-            out.append(sec)
-            continue
+            out.append(sec); continue
         new_sec = dict(sec)
         new_bullets = []
         for c in sec.get("contributions") or []:
             desc = c.get("description", "")
             if not isinstance(desc, str) or not desc.strip():
-                new_bullets.append(c)
-                continue
+                new_bullets.append(c); continue
             new_desc = paraphrase_bullet_strict(desc, allowed, model=model)
             new_bullets.append({**c, "description": new_desc})
         new_sec["contributions"] = new_bullets
         out.append(new_sec)
     return out
 
-def generate_tailored_summary_strict(resume, job_description, use_gpt=False, model="gpt-3.5-turbo"):
+def generate_tailored_summary_strict(resume, job_description, use_gpt=False, model="gpt-5.0"):
     header = next((sec for sec in resume if sec.get("type") == "header"), {})
     title = header.get("title", "Experienced Professional")
     years_exp = header.get("years_experience")
@@ -490,7 +544,6 @@ fdefs = defaults.get("filters", {})
 with st.sidebar:
     st.header("Options")
     db_path = st.text_input("Database file", value=defaults.get("db", "jobs.db"), key="gen_db_path")
-    gpt_options = _build_gpt_model_options(_openai_client)
 
     # configurable resume save directory
     resume_save_dir = st.text_input("Resume save folder", value=defaults.get("resume_save_dir", "kept_resumes"))
@@ -519,23 +572,21 @@ with st.sidebar:
         top_n_hybrid = st.slider("Top relevant items before chronological", 1, 10, 3, key="gen_topN")
 
     use_embeddings = st.checkbox("Use semantic matching (embeddings)", value=False, key="gen_use_embed")
-    embed_model = st.selectbox(
+    embed_model = _model_selectbox(
         "Embeddings model",
-        ["text-embedding-3-small", "text-embedding-3-large"],
-        index=0,
+        group="embeddings",
+        key="gen_embed_model",
         disabled=not use_embeddings,
-        key="gen_embed_model"
     )
 
     st.markdown("---")
     st.subheader("Rephrasing (no new facts)")
     gpt_paraphrase_bullets = st.checkbox("Paraphrase bullets to match JD wording (GPT)", value=False, key="gen_gp_bul")
-    gpt_model = st.selectbox(
+    gpt_model = _model_selectbox(
         "GPT model for rephrasing",
-        gpt_options,
-        index=0,
+        group="chat",
+        key="gen_gpt_model",
         disabled=not gpt_paraphrase_bullets,
-        key="gen_gpt_model"
     )
 
     st.markdown("---")
@@ -547,12 +598,11 @@ with st.sidebar:
         key="gen_sum_gpt",
         disabled=not add_tailored_summary
     )
-    gpt_summary_model = st.selectbox(
+    gpt_summary_model = _model_selectbox(
         "GPT model for summary",
-        gpt_options,
-        index=0,
+        group="chat",
         key="gen_sum_model",
-        disabled=not (add_tailored_summary and gpt_paraphrase_summary)
+        disabled=not (add_tailored_summary and gpt_paraphrase_summary),
     )
 
     st.caption("Filters below are loaded from report_defaults.yaml and applied here.")
@@ -563,14 +613,13 @@ with st.sidebar:
 # Persist save dir in session so button callbacks see it
 st.session_state["resume_save_dir"] = resolved_dir
 
-# Fetch candidates ≥ threshold
+# Fetch candidates ≥ threshold (exclude not_suitable/submitted early if columns exist)
 CANDIDATES = query_top_matches(
     defaults.get("db", "jobs.db"),
     limit=int(limit),
     min_score=float(threshold),
     hide_stale_days=None
 )
-# Exclude any that have already been marked not_suitable or submitted
 CANDIDATES = [
     c for c in CANDIDATES
     if int(c.get("not_suitable") or 0) == 0 and int(c.get("submitted") or 0) == 0
@@ -608,6 +657,71 @@ def unique_path(stem: str, ext: str) -> str:
 def path_to_file_url(path: str) -> str:
     abs_path = os.path.abspath(path).replace("\\", "/")
     return "file:///" + urllib.parse.quote(abs_path, safe="/:._-")
+
+# Small wrappers against job_store actions (stay no-op if functions missing)
+def _mark_not_suitable(db_path: str, job_id: str, reasons=None, note=None) -> bool:
+    if callable(_mark_not_suitable_db):
+        try:
+            # Newer signature (keyword, job_id)
+            return _mark_not_suitable_db(db_path=db_path, job_id=job_id, reasons=reasons or [], note=(note or ""))
+        except TypeError:
+            # Try alternate keyword (job_key)
+            try:
+                return _mark_not_suitable_db(db_path=db_path, job_key=job_id, reasons=reasons or [], note=(note or ""))
+            except TypeError:
+                # Oldest signature: (db_path, job_id)
+                try:
+                    return _mark_not_suitable_db(db_path, job_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    # Fallback: at least set status so it leaves actionable list; stash note in user_notes if supported
+    try:
+        user_notes = (note or ", ".join([str(x) for x in (reasons or []) if x])) or "not suitable"
+        set_job_status(db_path, job_id, status="not_suitable", user_notes=user_notes)
+        return True
+    except Exception:
+        return False
+
+def _mark_submitted(db_path: str, job_id: str) -> bool:
+    if callable(_mark_submitted_db):
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            # Newer signature (keyword, job_id)
+            return _mark_submitted_db(db_path=db_path, job_id=job_id, submitted=True, submitted_at=now_iso)
+        except TypeError:
+            # Try alternate keyword (job_key)
+            try:
+                return _mark_submitted_db(db_path=db_path, job_key=job_id, submitted=True, submitted_at=now_iso)
+            except TypeError:
+                # Oldest signature: (db_path, job_id)
+                try:
+                    return _mark_submitted_db(db_path, job_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    # Fallback: set status so it leaves actionable list
+    try:
+        set_job_status(db_path, job_id, status="submitted")
+        return True
+    except Exception:
+        return False
+
+def _list_submitted(db_path: str, limit: int = 500) -> list[dict]:
+    if callable(_query_submitted_db):
+        try:
+            return _query_submitted_db(db_path=db_path, limit=limit)
+        except TypeError:
+            # Very old signature: (db_path, limit)
+            try:
+                return _query_submitted_db(db_path, limit)
+            except Exception:
+                return []
+        except Exception:
+            return []
+    return []
 
 # Table with resume link / score if already saved
 if DISPLAY_JOBS:
@@ -665,8 +779,8 @@ if DISPLAY_JOBS:
                 gen_btn = st.button("Generate Resume", key=f"gen_{row_key}")
             with colB:
                 preview_exp = st.checkbox("Preview", value=True, key=f"prev_{row_key}")
-            # NEW: quick actions
-            # Not suitable (reasoned) — independent small form; no 'continue' used here
+
+            # Not suitable → reason + note; separate mini-form (no 'continue' here)
             with colC:
                 with st.expander("Not suitable", expanded=False):
                     ns_reason = st.selectbox(
@@ -680,6 +794,7 @@ if DISPLAY_JOBS:
                             "Security clearance/eligibility",
                             "Contract only",
                             "Company fit",
+                            "Spam/duplicate",
                             "Other",
                         ],
                         key=f"ns_reason_{row_key}",
@@ -707,13 +822,13 @@ if DISPLAY_JOBS:
 
             # Handle Submitted
             if sub_btn:
-                ok = _mark_submitted(defaults.get("db", "jobs.db"), job_id)
+                ok = _mark_submitted(db_path, job_id)
                 log(f"[submitted] job={job_id} ok={ok}")
                 if ok:
                     st.success("Marked as submitted.")
                     st.rerun()
                 else:
-                    st.error("Could not mark as submitted. Make sure job_store has set_job_submitted().")
+                    st.error("Could not mark as submitted. Ensure job_store.mark_submitted() exists.")
 
             # Generate → cache it
             if gen_btn:
@@ -740,11 +855,21 @@ if DISPLAY_JOBS:
                             resume,
                             jd_text,
                             use_gpt=st.session_state.get("gen_sum_gpt", False),
-                            model=st.session_state.get("gen_sum_model") or "gpt-3.5-turbo"
+                            model=st.session_state.get("gen_sum_model") or "gpt-5.0"
                         )
                 except Exception as e:
                     st.warning(f"Summary generation failed, omitting summary: {e}")
                     log("Summary failed:\n" + traceback.format_exc())
+
+                # Optional GPT paraphrase of bullets with strict guardrails
+                try:
+                    if st.session_state.get("gen_gp_bul", False):
+                        tailored = maybe_paraphrase_experience_bullets(
+                            tailored, jd_text, use_gpt=True, model=st.session_state.get("gen_gpt_model") or "gpt-5.0"
+                        )
+                except Exception as e:
+                    st.warning(f"Bullet paraphrase failed (using unmodified bullets): {e}")
+                    log("Paraphrase failed:\n" + traceback.format_exc())
 
                 # Render clean HTML
                 try:
@@ -888,7 +1013,6 @@ if DISPLAY_JOBS:
 st.markdown("---")
 st.subheader("📬 Submitted")
 submitted_rows = _list_submitted(defaults.get("db", "jobs.db"), limit=500)
-# Apply the same saved filters (e.g., location allowlist)
 submitted_rows = apply_saved_filters(submitted_rows, fdefs)
 
 def _row_sub(c):

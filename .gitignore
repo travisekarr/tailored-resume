@@ -10,3 +10,6 @@ __pycache__/
 
 # Real resume file (keep template)
 modular_resume_full.yaml
+
+# Saved Resumes
+kept_resumes/

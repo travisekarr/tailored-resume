@@ -1,6 +1,7 @@
 # job_store.py
 import os
 import json
+import json as _json
 import sqlite3
 from typing import Iterable, List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
@@ -37,14 +38,16 @@ def _to_iso_compat(s: str) -> str:
             hrs = float(s[:-1]); return (datetime.now(timezone.utc) - timedelta(hours=hrs)).isoformat()
         if s.endswith("d"):
             days = float(s[:-1]); return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    except Exception:
+    except Exception as e:
+        print(f"Error parsing relative time: {e}")
         pass
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.isoformat()
-    except Exception:
+    except Exception as e:
+        print(f"Error parsing ISO date: {e}")
         return utcnow()
 
 # ---------------------------
@@ -116,6 +119,158 @@ def init_db(db_path: Optional[str] = None) -> None:
             s = stmt.strip()
             if s:
                 conn.execute(s)
+
+# ====== OPENAI USAGE LOGGING ======
+
+OPENAI_PRICING_PATH = os.environ.get("OPENAI_PRICING_PATH", "openai_pricing.yaml")
+
+def _ensure_api_usage_table(conn: sqlite3.Connection):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          called_at TEXT,
+          endpoint TEXT,           -- 'chat.completions' | 'responses' | 'embeddings' | ...
+          model TEXT,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          total_tokens INTEGER,
+          request_id TEXT,
+          duration_ms INTEGER,
+          context TEXT,            -- 'ui:04_Generate_From_Jobs' | 'ui:job_finder' | 'cli' ...
+          meta_json TEXT,          -- extras per call
+          unit_in_per_mtok REAL,   -- snapshot of pricing used
+          unit_out_per_mtok REAL,
+          cost_usd REAL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_called_at ON api_usage(called_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_model ON api_usage(model)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_endpoint ON api_usage(endpoint)")
+
+def _load_pricing_yaml(path: str) -> dict:
+    try:
+        import yaml as _y
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = _y.safe_load(f) or {}
+                return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"Error loading pricing YAML: {e}")
+        pass
+    return {}
+
+def _estimate_cost_usd(model: str, endpoint: str, in_tok: int, out_tok: int, pricing: dict) -> tuple[float|None, float|None, float|None]:
+    """
+    Pricing YAML shape:
+      chat.completions:
+        gpt-4o:          { in_per_mtok: 5.0,  out_per_mtok: 15.0 }
+        gpt-4o-mini:     { in_per_mtok: 0.15, out_per_mtok: 0.60 }
+      embeddings:
+        text-embedding-3-small: { in_per_mtok: 0.02 }   # embeddings typically 'input' only
+
+    Returns (cost_usd, unit_in, unit_out). If no pricing found -> (None, None, None).
+    """
+    d_ep = (pricing.get(endpoint) or {})
+    d_mod = (d_ep.get(model) or {})
+    unit_in  = d_mod.get("in_per_mtok")
+    unit_out = d_mod.get("out_per_mtok")
+    if unit_in is None and unit_out is None:
+        return (None, None, None)
+    in_cost  = (in_tok or 0)  / 1_000_000 * float(unit_in  or 0.0)
+    out_cost = (out_tok or 0) / 1_000_000 * float(unit_out or 0.0)
+    return (round(in_cost + out_cost, 6), unit_in, unit_out)
+
+def log_api_usage(
+    *,
+    db_path: str | None = None,
+    endpoint: str,
+    model: str,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    total_tokens: int | None = None,
+    request_id: str | None = None,
+    duration_ms: int | None = None,
+    context: str | None = None,
+    meta: dict | None = None,
+    called_at: str | None = None,
+) -> int:
+    """
+    Insert a single usage row. Cost is estimated using openai_pricing.yaml if present.
+    Returns inserted row id.
+    """
+    init_db(db_path)
+    pricing = _load_pricing_yaml(OPENAI_PRICING_PATH)
+
+    # compute total if missing
+    if total_tokens is None:
+        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+
+    cost_usd, unit_in, unit_out = _estimate_cost_usd(model, endpoint, input_tokens or 0, output_tokens or 0, pricing)
+
+    with connect(db_path) as conn:
+        _ensure_api_usage_table(conn)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO api_usage (called_at, endpoint, model, input_tokens, output_tokens, total_tokens,
+                                   request_id, duration_ms, context, meta_json, unit_in_per_mtok, unit_out_per_mtok, cost_usd)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            called_at or utcnow(),
+            endpoint, model,
+            int(input_tokens or 0), int(output_tokens or 0), int(total_tokens or 0),
+            request_id or "",
+            int(duration_ms or 0) if duration_ms is not None else None,
+            context or "",
+            _json.dumps(meta or {}, ensure_ascii=False),
+            unit_in, unit_out,
+            cost_usd
+        ))
+        rid = int(cur.lastrowid)
+        conn.commit()
+        return rid
+
+# Simple readers for the analytics page
+def fetch_usage(
+    *,
+    db_path: str | None = None,
+    since: str | None = None,   # ISO or 'YYYY-MM-DD'
+    until: str | None = None,   # ISO or 'YYYY-MM-DD'
+    model: str | None = None,
+    endpoint: str | None = None,
+    context: str | None = None,
+    limit: int = 5000,
+) -> list[dict]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        _ensure_api_usage_table(conn)
+        where, args = [], []
+        if since:
+            where.append("called_at >= ?"); args.append(_to_iso(since))
+        if until:
+            where.append("called_at <= ?"); args.append(_to_iso(until))
+        if model:
+            where.append("model = ?"); args.append(model)
+        if endpoint:
+            where.append("endpoint = ?"); args.append(endpoint)
+        if context:
+            where.append("context = ?"); args.append(context)
+        sql = "SELECT id, called_at, endpoint, model, input_tokens, output_tokens, total_tokens, request_id, duration_ms, context, meta_json, unit_in_per_mtok, unit_out_per_mtok, cost_usd FROM api_usage"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY called_at DESC LIMIT ?"
+        args.append(int(limit))
+        rows = conn.execute(sql, args).fetchall()
+
+    cols = ["id","called_at","endpoint","model","input_tokens","output_tokens","total_tokens","request_id","duration_ms","context","meta_json","unit_in_per_mtok","unit_out_per_mtok","cost_usd"]
+    out = []
+    for r in rows:
+        d = {cols[i]: r[i] for i in range(len(cols))}
+        try:
+            d["meta"] = _json.loads(d.pop("meta_json") or "{}")
+        except Exception:
+            d["meta"] = {}
+        out.append(d)
+    return out
 
 # ---------------------------
 # Column helpers (for safe ALTERs)
@@ -223,7 +378,8 @@ def clear_jobs_data(db_path: Optional[str] = None, *, include_runs: bool = True,
             # Reclaim disk space after large deletes
             try:
                 conn.execute("VACUUM")
-            except Exception:
+            except Exception as e:
+                print(f"Error running VACUUM: {e}")
                 pass
 
     return {"jobs_deleted": int(jobs_deleted), "runs_deleted": int(runs_deleted)}
@@ -241,7 +397,8 @@ def nuke_database(db_path: Optional[str] = None) -> bool:
         try:
             with connect(path):
                 pass
-        except Exception:
+        except Exception as e:
+            print(f"Error closing stray connections: {e}")
             pass
 
         # Remove main + WAL/SHM if present
@@ -249,7 +406,8 @@ def nuke_database(db_path: Optional[str] = None) -> bool:
             try:
                 if os.path.exists(p):
                     os.remove(p)
-            except Exception:
+            except Exception as e:
+                print(f"Error removing DB file {p}: {e}")
                 # On Windows a locked file can raise; bubble up as False
                 return False
 
@@ -337,7 +495,8 @@ def prune_duplicates(db_path: Optional[str] = None) -> int:
 def _json_dumps_safe(obj) -> str:
     try:
         return json.dumps(obj, ensure_ascii=False)
-    except Exception:
+    except Exception as e:
+        print(f"Error dumping JSON: {e}")
         return "{}"
 
 def record_run(

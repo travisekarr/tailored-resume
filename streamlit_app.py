@@ -445,7 +445,8 @@ with st.sidebar:
         try:
             clear_embeddings_cache()
             st.success("Embeddings cache cleared.")
-        except Exception:
+        except Exception as e:
+            print(f"Error clearing embeddings cache: {e}")
             st.info("No cache file found or unable to clear.")
 
 st.markdown("Paste a job description below and click **Generate Resume** to get a customized resume based on your experience.")
@@ -647,7 +648,7 @@ if "generated_html" in st.session_state:
             import base64
             from io import BytesIO
 
-            # ❗ Preview AND download should be generated from the CLEAN HTML (no highlights)
+            #  Preview AND download should be generated from the CLEAN HTML (no highlights)
             preview_buf = BytesIO()
             WPHTML(string=html).write_pdf(preview_buf)   # use clean HTML, not highlighted_html
             preview_pdf = preview_buf.getvalue()
@@ -659,13 +660,14 @@ if "generated_html" in st.session_state:
             )
 
             st.download_button(
-                "📥 Download Resume as PDF",
+                " Download Resume as PDF",
                 data=preview_pdf,                     # same clean PDF as preview
                 file_name=f"{base_name}.pdf",
                 mime="application/pdf",
                 key="dl_resume_pdf"
             )
         except ImportError:
+            print("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF preview.")
             st.error("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF preview.")
 
 

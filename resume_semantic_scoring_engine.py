@@ -13,11 +13,15 @@ CACHE_FILE = "embeddings_cache.json"
 # =====================
 def load_resume(file_path):
     """Load the YAML resume as a list of sections."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        resume_sections = yaml.safe_load(f)
-    if not isinstance(resume_sections, list):
-        raise ValueError("Resume YAML must be a list of sections")
-    return resume_sections
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            resume_sections = yaml.safe_load(f)
+        if not isinstance(resume_sections, list):
+            raise ValueError("Resume YAML must be a list of sections")
+        return resume_sections
+    except Exception as e:
+        print(f"Error loading resume YAML: {e}")
+        return []
 
 
 # =====================
@@ -74,21 +78,30 @@ def section_text(section):
 # CACHE MANAGEMENT
 # =====================
 def _load_cache():
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+    try:
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Error loading embeddings cache: {e}")
     return {}
 
 
 def _save_cache(cache):
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(cache, f)
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except Exception as e:
+        print(f"Error saving embeddings cache: {e}")
 
 
 def clear_embeddings_cache():
     """Delete the embeddings cache file."""
-    if os.path.exists(CACHE_FILE):
-        os.remove(CACHE_FILE)
+    try:
+        if os.path.exists(CACHE_FILE):
+            os.remove(CACHE_FILE)
+    except Exception as e:
+        print(f"Error clearing embeddings cache: {e}")
 
 
 # =====================
@@ -96,33 +109,41 @@ def clear_embeddings_cache():
 # =====================
 def get_embedding(text, model="text-embedding-3-small"):
     """Get embedding from OpenAI with caching."""
-    from openai import OpenAI
-    client = OpenAI()
+    try:
+        from openai import OpenAI
+        client = OpenAI()
 
-    cache = _load_cache()
-    key = f"{model}:{text.strip()}"
-    if key in cache:
-        return cache[key]
+        cache = _load_cache()
+        key = f"{model}:{text.strip()}"
+        if key in cache:
+            return cache[key]
 
-    emb = client.embeddings.create(input=[text], model=model).data[0].embedding
-    cache[key] = emb
-    _save_cache(cache)
-    return emb
+        emb = client.embeddings.create(input=[text], model=model).data[0].embedding
+        cache[key] = emb
+        _save_cache(cache)
+        return emb
+    except Exception as e:
+        print(f"Error getting embedding: {e}")
+        return []
 
 
 def rank_by_embedding(resume, job_description, model="text-embedding-3-small"):
     """Rank sections by semantic similarity using OpenAI embeddings."""
-    job_embedding = get_embedding(job_description, model=model)
-    section_scores = []
-    for sec in resume:
-        emb = get_embedding(section_text(sec), model=model)
-        score = cosine_similarity([job_embedding], [emb])[0][0]
-        section_scores.append((sec, score))
+    try:
+        job_embedding = get_embedding(job_description, model=model)
+        section_scores = []
+        for sec in resume:
+            emb = get_embedding(section_text(sec), model=model)
+            score = cosine_similarity([job_embedding], [emb])[0][0]
+            section_scores.append((sec, score))
 
-    section_scores.sort(key=lambda x: x[1], reverse=True)
-    scores_dict = {id(sec): score for sec, score in section_scores}
-    ranked_sections = [sec for sec, _ in section_scores]
-    return ranked_sections, scores_dict
+        section_scores.sort(key=lambda x: x[1], reverse=True)
+        scores_dict = {id(sec): score for sec, score in section_scores}
+        ranked_sections = [sec for sec, _ in section_scores]
+        return ranked_sections, scores_dict
+    except Exception as e:
+        print(f"Error ranking by embedding: {e}")
+        return resume, {}
 
 
 # =====================
@@ -191,15 +212,16 @@ def enhance_experience_with_impact(
     if not use_gpt or bullets_per_role < 1:
         return resume
 
-    from openai import OpenAI
-    client = OpenAI()
+    try:
+        from openai import OpenAI
+        client = OpenAI()
 
-    for section in resume:
-        if section.get("type") != "experience":
-            continue
+        for section in resume:
+            if section.get("type") != "experience":
+                continue
 
-        existing = "\n".join("- " + c.get("description", "") for c in section.get("contributions", []))
-        base_prompt = f"""Job Description:
+            existing = "\n".join("- " + c.get("description", "") for c in section.get("contributions", []))
+            base_prompt = f"""Job Description:
 {job_description}
 
 Role: {section.get('title','')} at {section.get('company','')}
@@ -214,26 +236,32 @@ Generate ONE new bullet point (max 250 characters) that is:
 Return only the bullet sentence, no leading dash.
 """
 
-        for _ in range(bullets_per_role):
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are an expert resume writer optimizing resumes for specific job descriptions."},
-                    {"role": "user", "content": base_prompt.strip()}
-                ],
-                max_tokens=200,
-                temperature=0.5,
-            )
-            new_bullet = resp.choices[0].message.content.strip()
-            if not new_bullet:
-                continue
+            for _ in range(bullets_per_role):
+                try:
+                    resp = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": "You are an expert resume writer optimizing resumes for specific job descriptions."},
+                            {"role": "user", "content": base_prompt.strip()}
+                        ],
+                        max_tokens=200,
+                        temperature=0.5,
+                    )
+                    new_bullet = resp.choices[0].message.content.strip()
+                    if not new_bullet:
+                        continue
 
-            contrib = {
-                "description": new_bullet,
-                "skills_used": [],
-                "impact": True if mark_generated else False,
-                "source": "generated" if mark_generated else None,
-            }
-            section.setdefault("contributions", []).append(contrib)
-
-    return resume
+                    contrib = {
+                        "description": new_bullet,
+                        "skills_used": [],
+                        "impact": True if mark_generated else False,
+                        "source": "generated" if mark_generated else None,
+                    }
+                    section.setdefault("contributions", []).append(contrib)
+                except Exception as e:
+                    print(f"Error generating impact bullet: {e}")
+                    continue
+        return resume
+    except Exception as e:
+        print(f"Error enhancing experience with impact: {e}")
+        return resume

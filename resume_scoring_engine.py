@@ -2,8 +2,12 @@ import yaml
 from typing import List, Dict
 
 def load_resume(file_path: str) -> List[Dict]:
-    with open(file_path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"Error loading resume YAML: {e}")
+        return []
 
 def extract_keywords(text: str) -> List[str]:
     return [word.lower().strip(".,;:()") for word in text.split() if len(word) > 2]
