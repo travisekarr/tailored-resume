@@ -1,8 +1,30 @@
+import dateutil.parser
+def format_dt(val):
+    if not val:
+        return ""
+    try:
+        # Handle integer/float timestamps
+        if isinstance(val, (int, float)) or (isinstance(val, str) and val.strip().isdigit()):
+            dt = datetime.fromtimestamp(float(val), tz=pytz.UTC)
+        else:
+            # Try parsing RFC2822, ISO, etc.
+            dt = dateutil.parser.parse(str(val))
+            if not dt.tzinfo:
+                dt = dt.replace(tzinfo=pytz.UTC)
+        tz = pytz.timezone(TZ)
+        dt = dt.astimezone(tz)
+        return dt.strftime(DT_FMT)
+    except Exception:
+        return str(val)
 # pages/01_job_finder.py
 import os
 import json
 import streamlit as st
 import yaml
+import pytz
+from dotenv import load_dotenv
+import pandas as pd
+from datetime import datetime
 
 from job_hunter import hunt_jobs, probe_sources, load_sources_yaml
 from job_store import store_jobs
@@ -24,6 +46,20 @@ st.markdown(
 )
 
 # ---------- Helpers ----------
+load_dotenv()
+TZ = os.getenv("TIMEZONE", "America/New_York")
+DT_FMT = os.getenv("DATETIME_DISPLAY_FORMAT", "%Y-%m-%d:%I-%M %p")
+
+def format_dt(val):
+    if not val:
+        return ""
+    try:
+        dt = pd.to_datetime(val, utc=True)
+        tz = pytz.timezone(TZ)
+        dt = dt.tz_convert(tz)
+        return dt.strftime(DT_FMT)
+    except Exception:
+        return str(val)
 def _safe_str(x):
     if x is None:
         return ""
@@ -273,22 +309,22 @@ if run:
     if res["count"]:
         rows = []
         for it in res["items"]:
-            rows.append({
-                "score": float(it.get("score", 0.0) or 0.0),
-                "title": _safe_str(it.get("title","")),
-                "company": _safe_str(it.get("company","")),
-                "location": _safe_str(it.get("location","")),
-                "remote": bool(it.get("remote")),
-                "source": _safe_str(it.get("source","")),
-                "posted_at": _safe_str(it.get("posted_at","")),  # ← force string to avoid Arrow errors
-                "url": _safe_str(it.get("url","")),
-                "id": _safe_str(it.get("id","")),
-                "description": (
-                    (_safe_str(it.get("description",""))[:300] + "…")
-                    if len(_safe_str(it.get("description",""))) > 300
-                    else _safe_str(it.get("description",""))
-                ),
-            })
+                rows.append({
+                    "score": float(it.get("score", 0.0) or 0.0),
+                    "title": _safe_str(it.get("title","")),
+                    "company": _safe_str(it.get("company","")),
+                    "location": _safe_str(it.get("location","")),
+                    "remote": bool(it.get("remote")),
+                    "source": _safe_str(it.get("source","")),
+                    "posted_at": format_dt(it.get("posted_at","")),
+                    "url": _safe_str(it.get("url","")),
+                    "id": _safe_str(it.get("id","")),
+                    "description": (
+                        (_safe_str(it.get("description",""))[:300] + "…")
+                        if len(_safe_str(it.get("description",""))) > 300
+                        else _safe_str(it.get("description",""))
+                    ),
+                })
         table_container.dataframe(rows, use_container_width=True, height=480)
 
     # HTTP activity (every request + YAML events)

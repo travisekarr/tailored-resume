@@ -110,15 +110,12 @@ def clear_embeddings_cache():
 def get_embedding(text, model="text-embedding-3-small"):
     """Get embedding from OpenAI with caching."""
     try:
-        from openai import OpenAI
-        client = OpenAI()
-
+        from openai_utils import get_embedding as _get_embedding
         cache = _load_cache()
         key = f"{model}:{text.strip()}"
         if key in cache:
             return cache[key]
-
-        emb = client.embeddings.create(input=[text], model=model).data[0].embedding
+        emb = _get_embedding(text, model)
         cache[key] = emb
         _save_cache(cache)
         return emb
@@ -213,13 +210,10 @@ def enhance_experience_with_impact(
         return resume
 
     try:
-        from openai import OpenAI
-        client = OpenAI()
-
+        from openai_utils import chat_completion
         for section in resume:
             if section.get("type") != "experience":
                 continue
-
             existing = "\n".join("- " + c.get("description", "") for c in section.get("contributions", []))
             base_prompt = f"""Job Description:
 {job_description}
@@ -235,22 +229,15 @@ Generate ONE new bullet point (max 250 characters) that is:
 - Not redundant with existing bullets
 Return only the bullet sentence, no leading dash.
 """
-
             for _ in range(bullets_per_role):
                 try:
-                    resp = client.chat.completions.create(
-                        model=model,
-                        messages=[
-                            {"role": "system", "content": "You are an expert resume writer optimizing resumes for specific job descriptions."},
-                            {"role": "user", "content": base_prompt.strip()}
-                        ],
-                        max_tokens=200,
-                        temperature=0.5,
-                    )
-                    new_bullet = resp.choices[0].message.content.strip()
+                    messages = [
+                        {"role": "system", "content": "You are an expert resume writer optimizing resumes for specific job descriptions."},
+                        {"role": "user", "content": base_prompt.strip()}
+                    ]
+                    new_bullet, resp = chat_completion(messages, model=model, max_tokens=200, temperature=0.5, context="resume_semantic_scoring_engine:impact_bullet")
                     if not new_bullet:
                         continue
-
                     contrib = {
                         "description": new_bullet,
                         "skills_used": [],

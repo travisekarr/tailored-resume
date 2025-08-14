@@ -2,12 +2,29 @@
 import csv
 from io import StringIO
 from datetime import datetime, timedelta, timezone
+import pytz
+import os
+from dotenv import load_dotenv
 
 import pandas as pd
 import streamlit as st
 
 from job_store import query_jobs, prune_duplicates
 
+load_dotenv()
+TZ = os.getenv("TIMEZONE", "America/New_York")
+DT_FMT = os.getenv("DATETIME_DISPLAY_FORMAT", "%Y-%m-%d:%I-%M %p")
+
+def format_dt(val):
+    if not val:
+        return ""
+    try:
+        dt = pd.to_datetime(val, utc=True)
+        tz = pytz.timezone(TZ)
+        dt = dt.tz_convert(tz)
+        return dt.strftime(DT_FMT)
+    except Exception:
+        return str(val)
 st.set_page_config(page_title="Job History", layout="wide")
 st.title("🗂️ Job History — Saved Results")
 
@@ -104,6 +121,11 @@ for r in rows:
     # Flags may be missing in older rows — coerce safely
     d["submitted"] = _boolish(d.get("submitted"))
     d["not_suitable"] = _boolish(d.get("not_suitable"))
+
+    # Standardize date/time fields
+    for k in ["posted_at", "first_seen", "last_seen", "pulled_at", "created_at", "updated_at", "submitted_at", "not_suitable_at"]:
+        if k in d:
+            d[k] = format_dt(d.get(k))
 
     norm.append(d)
 

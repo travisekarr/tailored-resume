@@ -1,6 +1,9 @@
 # job_hunter.py
 import os
 import re
+from dotenv import load_dotenv
+import dateutil.parser
+import pytz
 _re = re
 import json
 import time
@@ -9,6 +12,13 @@ import hashlib
 import requests
 import feedparser
 from datetime import datetime, timezone
+load_dotenv()
+_TZ_NAME = os.getenv("TIMEZONE", "America/New_York")
+_DT_FORMAT = os.getenv("DATETIME_DISPLAY_FORMAT", "%Y-%m-%d:%I-%M %p")
+try:
+    _TZ = pytz.timezone(_TZ_NAME)
+except Exception:
+    _TZ = pytz.timezone("America/New_York")
 from typing import Dict, Any, List, Tuple, Optional
 from collections import Counter, defaultdict
 
@@ -16,13 +26,7 @@ import yaml
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Optional OpenAI embeddings
-try:
-    from openai import OpenAI
-    _openai_client = OpenAI()
-except Exception as e:
-    print(f"Error importing OpenAI: {e}")
-    _openai_client = None
+from openai_utils import get_embedding
 
 # Optional content extractors (graceful fallback)
 try:
@@ -49,7 +53,9 @@ except Exception as e:
 # Utilities & logging
 # -----------------------------
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(_TZ)
+    return now_local.strftime(_DT_FORMAT)
 
 def _clean_text(x: Optional[str]) -> str:
     return (x or "").strip()
@@ -67,7 +73,6 @@ def _log(logs: list, msg: str, data: Optional[dict] = None):
     if "enrich.skip" not in msg:
         log_entry = {"ts": utcnow(), "msg": msg, "data": data or {}}
         if "error" in msg.lower():
-            # ANSI escape code for bright red
             print(f"\033[91m{log_entry}\033[0m")
         else:
             print(log_entry)
@@ -140,6 +145,26 @@ def _is_remote(it: dict) -> bool:
     if "remote" in tit: return True
     if "remote" in desc: return True
     return False
+
+# -----------------------------
+# Date/time normalization utility
+# -----------------------------
+def normalize_datetime(val) -> Optional[datetime]:
+    """
+    Convert any date value (int, float, ISO, RFC2822, etc.) to a timezone-aware datetime (UTC).
+    Returns None if conversion fails.
+    """
+    if not val:
+        return None
+    try:
+        if isinstance(val, (int, float)) or (isinstance(val, str) and val.strip().isdigit()):
+            return datetime.fromtimestamp(float(val), tz=timezone.utc)
+        dt = dateutil.parser.parse(str(val))
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 # -----------------------------
 # YAML loader (with legacy support)
@@ -320,7 +345,7 @@ def fetch_rss(feed_url: str, source: str, logs: list) -> List[dict]:
 
 def _log_openai_usage_resp(resp, *, endpoint: str, model: str, context: str = "cli", db_path: str | None = None):
     try:
-        from job_store import log_api_usage
+    # log_api_usage is now handled in openai_utils
         # Chat/Responses usage fields differ; Embeddings has .usage.total_tokens
         usage = getattr(resp, "usage", None)
         if usage:
@@ -332,11 +357,6 @@ def _log_openai_usage_resp(resp, *, endpoint: str, model: str, context: str = "c
             itok = getattr(resp, "usage", {}).get("total_tokens", 0) if isinstance(resp.__dict__.get("usage"), dict) else 0
             otok, ttok = 0, itok
         req_id = getattr(resp, "id", "") or getattr(resp, "request_id", "") or ""
-        log_api_usage(
-            db_path=db_path, endpoint=endpoint, model=model,
-            input_tokens=itok or 0, output_tokens=otok or 0, total_tokens=ttok or 0,
-            request_id=req_id, context=context, meta={}
-        )
     except Exception as e:
         print(f"Error logging OpenAI usage: {e}")
         pass
@@ -402,9 +422,6 @@ def _score_embeddings(
     logs: list | None = None,
 ) -> list[float]:
     """Embedding-based scoring with strict batching and recursive split on 300k-cap errors."""
-    if _openai_client is None:
-        return [0.0] * len(job_texts)
-
     # 1) Clean inputs
     resume_clean = _clean_for_embedding(resume_text or "")
     jobs_clean   = [_clean_for_embedding(t or "") for t in job_texts]
@@ -416,11 +433,10 @@ def _score_embeddings(
 
     # 2) Embed resume once (retry on model mismatch with -3-small)
     try:
-        res = _openai_client.embeddings.create(model=embedding_model, input=resume_clean)
+        resume_vec = get_embedding(resume_clean, embedding_model)
     except Exception:
-        res = _openai_client.embeddings.create(model="text-embedding-3-small", input=resume_clean)
+        resume_vec = get_embedding(resume_clean, "text-embedding-3-small")
         embedding_model = "text-embedding-3-small"
-    resume_vec = res.data[0].embedding
 
     # 3) Prepare batches
     batches = _chunk_by_token_budget(
@@ -433,40 +449,32 @@ def _score_embeddings(
     job_vecs: list[list[float]] = []
 
     def _embed_batch(texts: list[str]) -> list[list[float]]:
-        # try whole batch
         est = sum(_estimate_tokens(t, embedding_model) for t in texts)
         if logs is not None:
             _log(logs, "embeddings.batch", {
                 "model": embedding_model, "batch_size": len(texts), "est_tokens": int(est * _SAFETY_FACTOR)
             })
         try:
-            resp = _openai_client.embeddings.create(model=embedding_model, input=texts)
-            return [d.embedding for d in resp.data]
+            return [get_embedding(t, embedding_model) for t in texts]
         except Exception as e:
             msg = str(e)
-            # If we hit the token cap, split and recurse
             if ("max_tokens_per_request" in msg) or ("max 300000 tokens" in msg):
                 if logs is not None:
                     _log(logs, "embeddings.batch.split", {
                         "reason": "max_tokens_per_request", "size": len(texts), "est_tokens": int(est * _SAFETY_FACTOR)
                     })
                 if len(texts) == 1:
-                    # last-ditch: hard-trim further and try once more
                     t0 = texts[0][: max(1000, _MAX_CHARS_PER_INPUT // 2)]
                     try:
-                        resp2 = _openai_client.embeddings.create(model=embedding_model, input=t0)
-                        return [resp2.data[0].embedding]
+                        return [get_embedding(t0, embedding_model)]
                     except Exception:
-                        # fallback tiny vector of zeros to keep alignment
                         return [[0.0] * len(resume_vec)]
                 mid = len(texts) // 2
                 left  = _embed_batch(texts[:mid])
                 right = _embed_batch(texts[mid:])
                 return left + right
-            # Other errors: rethrow (handled by caller to fall back TF-IDF if desired)
             raise
 
-    # 4) Embed all batches in order
     try:
         for b in batches:
             job_vecs.extend(_embed_batch(b))
@@ -475,7 +483,6 @@ def _score_embeddings(
     except Exception as e:
         if logs is not None:
             _log(logs, "embeddings.error", {"model": embedding_model, "error": str(e)})
-        # Fallback to TF-IDF on any unexpected failure
         return _score_tfidf(resume_text, job_texts)
 
     # 5) Cosine similarities
@@ -501,31 +508,42 @@ def _score_embeddings(
 def fetch_remoteok(cfg: dict, logs: list) -> List[dict]:
     if not cfg.get("enabled"):
         return []
-    url = "https://remoteok.com/api"
-    r, _ = _http_get(url, logs, headers={"User-Agent": "Mozilla/5.0"})
+    base = "https://remoteok.com/api"
     results: List[dict] = []
-    if r and r.status_code == 200:
-        try:
-            data = r.json()
-            for it in data:
-                if not isinstance(it, dict) or not (it.get("slug") or it.get("id")):
-                    continue
-                results.append({
-                    "id": str(it.get("id") or it.get("slug")),
-                    "title": it.get("position") or it.get("title"),
-                    "company": it.get("company"),
-                    "location": it.get("location") or it.get("region") or "",
-                    "remote": True,
-                    "url": "https://remoteok.com" + (it.get("url") or ""),
-                    "source": "remoteok",
-                    "posted_at": it.get("date") or it.get("epoch"),
-                    "pulled_at": utcnow(),
-                    "description": it.get("description") or "",
-                })
-        except Exception as e:
-            print(f"Error parsing remoteok data: {e}")
-            _log(logs, "remoteok.parse_error", {"error": str(e)})
-    return results
+    queries = cfg.get("queries") or [""]
+    limit = int(cfg.get("limit") or 200)
+    for q in queries:
+        url = base
+        if q:
+            url = f"{base}?search={requests.utils.quote(q)}"
+        r, _ = _http_get(url, logs, headers={"User-Agent": "Mozilla/5.0"})
+        if r and r.status_code == 200:
+            try:
+                data = r.json()
+                # RemoteOK returns a list, sometimes with a metadata dict at index 0
+                jobs = data if isinstance(data, list) else []
+                # Remove metadata if present
+                if jobs and isinstance(jobs[0], dict) and jobs[0].get("id") is None:
+                    jobs = jobs[1:]
+                for it in jobs:
+                    # Some jobs may be missing fields; be robust
+                    final_url = it.get("url") or it.get("link") or it.get("apply_url") or ""
+                    results.append({
+                        "id": it.get("id") or _hash_id(final_url or it.get("position", "")),
+                        "title": it.get("position") or it.get("title"),
+                        "company": it.get("company"),
+                        "location": it.get("location") or it.get("region") or "",
+                        "remote": True,
+                        "url": final_url,
+                        "source": "remoteok",
+                        "posted_at": normalize_datetime(it.get("date") or it.get("epoch")),
+                        "pulled_at": normalize_datetime(utcnow()),
+                        "description": it.get("description") or "",
+                    })
+            except Exception as e:
+                print(f"Error parsing remoteok data: {e}")
+                _log(logs, "remoteok.parse_error", {"error": str(e)})
+    return results[:limit]
 
 def fetch_remotive(cfg: dict, logs: list) -> List[dict]:
     if not cfg.get("enabled"):
@@ -553,8 +571,8 @@ def fetch_remotive(cfg: dict, logs: list) -> List[dict]:
                                 "remote": True,
                                 "url": it.get("url"),
                                 "source": "remotive",
-                                "posted_at": it.get("publication_date"),
-                                "pulled_at": utcnow(),
+                                "posted_at": normalize_datetime(it.get("publication_date")),
+                                "pulled_at": normalize_datetime(utcnow()),
                                 "description": it.get("description") or "",
                             })
                     except Exception as e:
@@ -653,8 +671,8 @@ def fetch_weworkremotely(cfg: dict, logs: list) -> List[dict]:
                 "remote": True,
                 "url": url,
                 "source": "weworkremotely",
-                "posted_at": posted,
-                "pulled_at": utcnow(),
+                "posted_at": normalize_datetime(posted),
+                "pulled_at": normalize_datetime(utcnow()),
                 "description": desc,
             })
     return results
@@ -663,7 +681,12 @@ def fetch_hnrss(cfg: dict, logs: list) -> List[dict]:
     if not cfg.get("enabled"):
         return []
     feed = cfg.get("feed") or "https://hnrss.org/jobs"
-    return fetch_rss(feed, "hnrss", logs)
+    # Patch fetch_rss to normalize posted_at and pulled_at
+    raw = fetch_rss(feed, "hnrss", logs)
+    for r in raw:
+        r["posted_at"] = normalize_datetime(r.get("posted_at"))
+        r["pulled_at"] = normalize_datetime(r.get("pulled_at"))
+    return raw
 
 def fetch_jobicy(cfg: dict, logs: list) -> List[dict]:
     if not cfg.get("enabled"):
@@ -685,8 +708,8 @@ def fetch_jobicy(cfg: dict, logs: list) -> List[dict]:
                     "remote": True,
                     "url": it.get("url") or it.get("jobUrl"),
                     "source": "jobicy",
-                    "posted_at": it.get("pubDate") or it.get("date"),
-                    "pulled_at": utcnow(),
+                    "posted_at": normalize_datetime(it.get("pubDate") or it.get("date")),
+                    "pulled_at": normalize_datetime(utcnow()),
                     "description": it.get("jobDescription") or it.get("description") or "",
                 })
         except Exception as e:
@@ -717,8 +740,8 @@ def fetch_arbeitnow(cfg: dict, logs: list) -> List[dict]:
                     "remote": True,
                     "url": it.get("url"),
                     "source": "arbeitnow",
-                    "posted_at": it.get("created_at") or it.get("published_at"),
-                    "pulled_at": utcnow(),
+                    "posted_at": normalize_datetime(it.get("created_at") or it.get("published_at")),
+                    "pulled_at": normalize_datetime(utcnow()),
                     "description": it.get("description") or "",
                 })
         except Exception as e:
@@ -761,8 +784,8 @@ def fetch_usajobs(cfg: dict, logs: list) -> List[dict]:
                     "remote": False,
                     "url": url,
                     "source": "usajobs",
-                    "posted_at": pos.get("PublicationStartDate"),
-                    "pulled_at": utcnow(),
+                    "posted_at": normalize_datetime(pos.get("PublicationStartDate")),
+                    "pulled_at": normalize_datetime(utcnow()),
                     "description": pos.get("UserArea", {}).get("Details", {}).get("JobSummary",""),
                 })
         except Exception as e:
@@ -804,8 +827,8 @@ def fetch_adzuna(cfg: dict, logs: list) -> List[dict]:
                     "remote": False,
                     "url": it.get("redirect_url"),
                     "source": "adzuna",
-                    "posted_at": it.get("created"),
-                    "pulled_at": utcnow(),
+                    "posted_at": normalize_datetime(it.get("created")),
+                    "pulled_at": normalize_datetime(utcnow()),
                     "description": it.get("description") or "",
                 })
         except Exception as e:
@@ -842,8 +865,8 @@ def fetch_jooble(cfg: dict, logs: list) -> List[dict]:
                     "remote": "remote" in (it.get("type","").lower()),
                     "url": it.get("link"),
                     "source": "jooble",
-                    "posted_at": it.get("updated"),
-                    "pulled_at": utcnow(),
+                    "posted_at": normalize_datetime(it.get("updated")),
+                    "pulled_at": normalize_datetime(utcnow()),
                     "description": it.get("snippet") or "",
                 })
         except Exception as e:
@@ -855,33 +878,34 @@ def fetch_themuse(cfg: dict, logs: list) -> List[dict]:
     if not cfg.get("enabled"):
         return []
     base = "https://www.themuse.com/api/public/jobs"
-    category = cfg.get("category") or "Software Engineering"
+    category = [cfg.get("category") or "Software Engineering"]
     pages = int(cfg.get("pages") or 2)
     out: List[dict] = []
-    for p in range(1, pages + 1):
-        params = {"page": p, "category": category}
-        r, _ = _http_get(base, logs, params=params)
-        if not r or r.status_code != 200:
-            break
-        try:
-            data = r.json()
-            for it in data.get("results", []):
-                locs = ", ".join([l.get("name","") for l in it.get("locations",[])])
-                out.append({
-                    "id": str(it.get("id") or _hash_id(it.get("refs",{}).get("landing_page",""))),
-                    "title": it.get("name"),
-                    "company": (it.get("company") or {}).get("name"),
-                    "location": locs,
-                    "remote": "remote" in locs.lower(),
-                    "url": (it.get("refs") or {}).get("landing_page"),
-                    "source": "themuse",
-                    "posted_at": it.get("publication_date"),
-                    "pulled_at": utcnow(),
-                    "description": it.get("contents") or "",
-                })
-        except Exception as e:
-            print(f"Error parsing themuse data: {e}")
-            _log(logs, "themuse.parse_error", {"error": str(e)})
+    for cat in category:
+        for p in range(1, pages + 1):
+            params = {"page": p, "category": cat}
+            r, _ = _http_get(base, logs, params=params)
+            if not r or r.status_code != 200:
+                break
+            try:
+                data = r.json()
+                for it in data.get("results", []):
+                    locs = ", ".join([l.get("name","") for l in it.get("locations",[])])
+                    out.append({
+                        "id": str(it.get("id") or _hash_id(it.get("refs",{}).get("landing_page",""))),
+                        "title": it.get("name"),
+                        "company": (it.get("company") or {}).get("name"),
+                        "location": locs,
+                        "remote": "remote" in locs.lower(),
+                        "url": (it.get("refs") or {}).get("landing_page"),
+                        "source": "themuse",
+                        "posted_at": normalize_datetime(it.get("publication_date")),
+                        "pulled_at": normalize_datetime(utcnow()),
+                        "description": it.get("contents") or "",
+                    })
+            except Exception as e:
+                print(f"Error parsing themuse data: {e}")
+                _log(logs, "themuse.parse_error", {"error": str(e)})
     return out
 
 def fetch_findwork(cfg: dict, logs: list) -> List[dict]:
@@ -907,8 +931,8 @@ def fetch_findwork(cfg: dict, logs: list) -> List[dict]:
                     "remote": bool(it.get("remote")),
                     "url": it.get("url"),
                     "source": "findwork",
-                    "posted_at": it.get("date_posted"),
-                    "pulled_at": utcnow(),
+                    "posted_at": normalize_datetime(it.get("date_posted")),
+                    "pulled_at": normalize_datetime(utcnow()),
                     "description": it.get("text") or "",
                 })
         except Exception as e:
@@ -934,11 +958,11 @@ def fetch_greenhouse(cfg: dict, logs: list) -> List[dict]:
                         "title": it.get("title"),
                         "company": comp,
                         "location": (it.get("location") or {}).get("name",""),
-                        "remote": "remote" in ((it.get("location") or {}).get("name","").lower()),
+                        "remote": "remote" in ((it.get("location") or {}).get("name","" ).lower()),
                         "url": it.get("absolute_url"),
                         "source": "greenhouse",
-                        "posted_at": it.get("updated_at") or it.get("created_at"),
-                        "pulled_at": utcnow(),
+                        "posted_at": normalize_datetime(it.get("updated_at") or it.get("created_at")),
+                        "pulled_at": normalize_datetime(utcnow()),
                         "description": "",  # can be enriched later
                     })
             except Exception as e:
@@ -963,11 +987,11 @@ def fetch_lever(cfg: dict, logs: list) -> List[dict]:
                         "title": it.get("text") or it.get("title"),
                         "company": comp,
                         "location": (it.get("categories") or {}).get("location",""),
-                        "remote": "remote" in ((it.get("categories") or {}).get("location","").lower()),
+                        "remote": "remote" in ((it.get("categories") or {}).get("location","" ).lower()),
                         "url": it.get("hostedUrl"),
                         "source": "lever",
-                        "posted_at": it.get("createdAt"),
-                        "pulled_at": utcnow(),
+                        "posted_at": normalize_datetime(it.get("createdAt")),
+                        "pulled_at": normalize_datetime(utcnow()),
                         "description": (it.get("descriptionPlain") or ""),
                     })
             except Exception as e:
@@ -998,8 +1022,8 @@ def fetch_workable(cfg: dict, logs: list) -> List[dict]:
                         "remote": bool(loc.get("remote")),
                         "url": it.get("url"),
                         "source": "workable",
-                        "posted_at": it.get("published_on"),
-                        "pulled_at": utcnow(),
+                        "posted_at": normalize_datetime(it.get("published_on")),
+                        "pulled_at": normalize_datetime(utcnow()),
                         "description": "",  # can enrich
                     })
             except Exception as e:
@@ -1028,8 +1052,8 @@ def fetch_smartrecruiters(cfg: dict, logs: list) -> List[dict]:
                         "remote": False,
                         "url": (it.get("ref") or {}).get("jobAd") or it.get("applyUrl"),
                         "source": "smartrecruiters",
-                        "posted_at": it.get("releasedDate"),
-                        "pulled_at": utcnow(),
+                        "posted_at": normalize_datetime(it.get("releasedDate")),
+                        "pulled_at": normalize_datetime(utcnow()),
                         "description": "",
                     })
             except Exception as e:
@@ -1057,8 +1081,8 @@ def fetch_recruitee(cfg: dict, logs: list) -> List[dict]:
                         "remote": bool((it.get("remote") or {}).get("status") == "remote"),
                         "url": f"https://{comp}.recruitee.com/o/{it.get('slug')}",
                         "source": "recruitee",
-                        "posted_at": it.get("created_at"),
-                        "pulled_at": utcnow(),
+                        "posted_at": normalize_datetime(it.get("created_at")),
+                        "pulled_at": normalize_datetime(utcnow()),
                         "description": it.get("description") or "",
                     })
             except Exception as e:
@@ -1089,8 +1113,8 @@ def fetch_personio(cfg: dict, logs: list) -> List[dict]:
                         "remote": "remote" in (loc_str.lower()),
                         "url": url_apply,
                         "source": "personio",
-                        "posted_at": it.get("created_at"),
-                        "pulled_at": utcnow(),
+                        "posted_at": normalize_datetime(it.get("created_at")),
+                        "pulled_at": normalize_datetime(utcnow()),
                         "description": it.get("description") or "",
                     })
             except Exception as e:
@@ -1473,7 +1497,12 @@ def hunt_jobs(
         prior       = source_prior.get((it.get("source") or "").lower(), 0.0)
         final = 0.70 * float(base) + 0.25 * title_boost + 0.05 * (body_boost + prior)
         it = dict(it)
-        it["score"] = float(final)
+        # Only update score and scoring_model if embeddings were used
+        if use_embeddings:
+            it["score"] = float(final)
+            it["scoring_model"] = embedding_model
+        else:
+            it["scoring_model"] = it.get("scoring_model", "no model")
         it["match_terms_title"] = title_terms
         it["match_terms_body"]  = desc_terms
         it["id"] = it.get("id") or _hash_id((it.get("url") or it.get("title","")))

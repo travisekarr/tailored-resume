@@ -1,11 +1,45 @@
+import dateutil.parser
+def format_dt(val):
+    if not val:
+        return ""
+    try:
+        # Handle integer/float timestamps
+        if isinstance(val, (int, float)) or (isinstance(val, str) and val.strip().isdigit()):
+            dt = datetime.fromtimestamp(float(val), tz=pytz.UTC)
+        else:
+            # Try parsing RFC2822, ISO, etc.
+            dt = dateutil.parser.parse(str(val))
+            if not dt.tzinfo:
+                dt = dt.replace(tzinfo=pytz.UTC)
+        tz = pytz.timezone(TZ)
+        dt = dt.astimezone(tz)
+        return dt.strftime(DT_FMT)
+    except Exception:
+        return str(val)
 # pages/05_Usage_Analytics.py
 import os
 import pandas as pd
 import streamlit as st
 from datetime import datetime, timedelta, timezone
+import pytz
+from dotenv import load_dotenv
 
 from job_store import fetch_usage
 
+load_dotenv()
+TZ = os.getenv("TIMEZONE", "America/New_York")
+DT_FMT = os.getenv("DATETIME_DISPLAY_FORMAT", "%Y-%m-%d:%I-%M %p")
+
+def format_dt(val):
+    if not val:
+        return ""
+    try:
+        dt = pd.to_datetime(val, utc=True)
+        tz = pytz.timezone(TZ)
+        dt = dt.tz_convert(tz)
+        return dt.strftime(DT_FMT)
+    except Exception:
+        return str(val)
 st.set_page_config(page_title="Usage Analytics", layout="wide")
 st.title("📊 OpenAI Usage & Cost (Est.)")
 
@@ -19,15 +53,12 @@ def _iso(d: datetime) -> str:
 
 with st.sidebar:
     st.header("Filters")
-    try:
-        db_path = st.text_input("Database file", value=os.environ.get("JOBS_DB_PATH", "jobs.db"))
-        days = st.slider("Lookback (days)", 1, 90, 30)
-        group = st.selectbox("Group by", ["day", "week", "month"], index=0)
-        model_filter = st.text_input("Model contains", value="")
-        endpoint_filter = st.selectbox("Endpoint", ["(any)", "chat.completions", "responses", "embeddings"], index=0)
-        context_filter = st.text_input("Context equals (optional)", value="")  # e.g. ui:04_Generate_From_Jobs
-    except Exception as e:
-        print(f"Error in sidebar input: {e}")
+    db_path = st.text_input("Database file", value="jobs.db")
+    days = st.slider("Lookback (days)", 1, 90, 30)
+    group = st.selectbox("Group by", ["day", "week", "month"], index=0)
+    model_filter = st.text_input("Model contains", value="")
+    endpoint_filter = st.selectbox("Endpoint", ["(any)", "chat.completions", "responses", "embeddings"], index=0)
+    context_filter = st.text_input("Context equals (optional)", value="")  # e.g. ui:04_Generate_From_Jobs
 
 since = _iso(_now() - timedelta(days=days))
 until = _iso(_now())
@@ -50,10 +81,7 @@ if not usage:
     st.stop()
 
 df = pd.DataFrame(usage)
-df["called_at"] = pd.to_datetime(df["called_at"], errors="coerce")
-df["date"] = df["called_at"].dt.date
-df["week"] = df["called_at"].dt.to_period("W").apply(lambda p: p.start_time.date())
-df["month"] = df["called_at"].dt.to_period("M").apply(lambda p: p.start_time.date())
+df["called_at"] = df["called_at"].apply(format_dt)
 
 # Top summary
 total_calls = len(df)

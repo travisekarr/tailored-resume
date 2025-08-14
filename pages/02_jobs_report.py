@@ -6,12 +6,14 @@ import yaml
 import json
 import re
 from datetime import datetime, timedelta, timezone
+import pytz
+from dotenv import load_dotenv
 from dateutil import parser as dtparse
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import dateutil.parser
 
 from job_store import (
     query_new_since,
@@ -67,6 +69,20 @@ STOPWORDS = {
 }
 
 # ================== Load/save defaults ==================
+load_dotenv()
+TZ = os.getenv("TIMEZONE", "America/New_York")
+DT_FMT = os.getenv("DATETIME_DISPLAY_FORMAT", "%Y-%m-%d:%I-%M %p")
+
+def format_dt(val):
+    if not val:
+        return ""
+    try:
+        dt = pd.to_datetime(val, utc=True)
+        tz = pytz.timezone(TZ)
+        dt = dt.tz_convert(tz)
+        return dt.strftime(DT_FMT)
+    except Exception:
+        return str(val)
 def load_defaults(path=DEFAULTS_PATH):
     if not os.path.exists(path):
         return DEFAULTS_FALLBACK.copy()
@@ -188,27 +204,7 @@ def filter_changed(events, fields):
     return [e for e in events if e.get("field") in fields]
 
 def fmt_est(dt_val):
-    """Return YYYY-MM-DDTHH:MM:SS in America/New_York; drop microseconds."""
-    if not dt_val:
-        return ""
-    try:
-        # numeric epoch (RemoteOK occasionally)
-        if isinstance(dt_val, (int, float)) or (isinstance(dt_val, str) and dt_val.strip().isdigit()):
-            ts = int(float(dt_val))
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        else:
-            s = str(dt_val).strip().replace("Z", "+00:00")
-            dt = dtparse.parse(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            else:
-                dt = dt.astimezone(timezone.utc)
-
-        est = dt.astimezone(ZoneInfo("America/New_York")).replace(microsecond=0)
-        return est.strftime("%Y-%m-%dT%H:%M:%S")
-    except Exception:
-        # if parsing fails, just return original string
-        return str(dt_val)
+    return format_dt(dt_val)
 
 def location_allowed(loc_value: str | None, allowed: list[str], allow_empty: bool) -> bool:
     """

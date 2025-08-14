@@ -5,6 +5,8 @@ import traceback
 import urllib.parse
 from io import BytesIO
 from datetime import datetime, timezone
+import pytz
+from dotenv import load_dotenv
 import streamlit as st
 import yaml
 import pandas as pd
@@ -12,8 +14,12 @@ from dotenv import load_dotenv
 from jinja2 import Environment, FileSystemLoader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from openai import OpenAI
+from openai_utils import chat_completion
 from resume_semantic_scoring_engine import load_resume, generate_tailored_resume
+
+# Model config helpers
+from models_config import load_models_cfg, ui_choices, ui_default, model_pricing
+
 
 
 # Core job DB helpers
@@ -48,66 +54,38 @@ MODEL_SETTINGS_PATH = "api_models.yaml"   # <- unified model settings YAML
 
 # Environment / OpenAI
 load_dotenv()
-_openai_client = OpenAI()  # safe if key missing; we gate GPT usage behind toggles
+TZ = os.getenv("TIMEZONE", "America/New_York")
+DT_FMT = os.getenv("DATETIME_DISPLAY_FORMAT", "%Y-%m-%d:%I-%M %p")
 
-
-# ==============================
-# Model settings (YAML-driven)
-# ==============================
-_MODEL_FALLBACK = {
-    "models": {
-        "chat": {
-            "default": "gpt-5.0",
-            "options": [
-                {"id": "gpt-5.0", "display": "GPT 5.0 (Thinking)"},
-                {"id": "gpt-5o",  "display": "GPT-5o"},
-                {"id": "gpt-4.1", "display": "GPT-4.1"},
-                {"id": "gpt-4o",  "display": "GPT-4o"},
-                {"id": "gpt-4",   "display": "GPT-4"},
-                {"id": "gpt-3.5-turbo", "display": "GPT-3.5 Turbo"},
-            ],
-        },
-        "embeddings": {
-            "default": "text-embedding-3-small",
-            "options": [
-                {"id": "text-embedding-3-small", "display": "Text Embedding 3 Small"},
-                {"id": "text-embedding-3-large", "display": "Text Embedding 3 Large"},
-            ],
-        },
-    }
-}
-
-def _load_model_settings(path: str = MODEL_SETTINGS_PATH) -> dict:
+def format_dt(val):
+    if not val:
+        return ""
     try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-            # minimal validation
-            if "models" in data and "chat" in data["models"] and "embeddings" in data["models"]:
-                return data
+        dt = pd.to_datetime(val, utc=True)
+        tz = pytz.timezone(TZ)
+        dt = dt.tz_convert(tz)
+        return dt.strftime(DT_FMT)
     except Exception:
-        pass
-    return _MODEL_FALLBACK
+        return str(val)
+# _openai_client = OpenAI()  # replaced by openai_utils
+
+
+
+# ==============================
+# Model selection using models_config.py and openai_pricing.yaml
+# ==============================
+_model_cfg = load_models_cfg()
 
 def _model_selectbox(label: str, group: str, *, key: str, disabled: bool = False):
-    """
-    Render a selectbox using YAML-backed model options.
-    Stores the selected **model id** in session (so the rest of the code can
-    pass it directly to OpenAI). Displays the **display** label.
-    """
-    settings = _load_model_settings()
-    grp = settings["models"][group]
-    opts = grp.get("options", [])
-    default_id = grp.get("default") or (opts[0]["id"] if opts else "")
-    ids = [o["id"] for o in opts]
-    id_to_label = {o["id"]: o.get("display", o["id"]) for o in opts}
-
-    def _fmt(x): return id_to_label.get(x, x)
+    choices = ui_choices(_model_cfg, group)
+    default_id = ui_default(_model_cfg, group)
+    ids = [id for _, id in choices]
+    labels = {id: display for display, id in choices}
+    def _fmt(x): return labels.get(x, x)
     try:
         default_idx = ids.index(default_id) if default_id in ids else 0
     except Exception:
         default_idx = 0
-
     return st.selectbox(
         label,
         ids,
@@ -292,26 +270,7 @@ def make_arrow_friendly(df: pd.DataFrame) -> pd.DataFrame:
                 df[col] = df[col].astype("string")
     return df
 
-def _log_chat_usage(resp, model: str, context: str):
-    try:
-        u = resp.usage
-        it = getattr(u, "prompt_tokens", None) or getattr(u, "input_tokens", None) or 0
-        ot = getattr(u, "completion_tokens", None) or getattr(u, "output_tokens", None) or 0
-        tt = getattr(u, "total_tokens", None) or (it + ot)
-        rid = getattr(resp, "id", "") or getattr(resp, "request_id", "")
-        log_api_usage(
-            db_path=st.session_state.get("gen_db_path") or "jobs.db",
-            endpoint="chat.completions",
-            model=model,
-            input_tokens=int(it or 0),
-            output_tokens=int(ot or 0),
-            total_tokens=int(tt or 0),
-            request_id=rid,
-            context=context,
-            meta={}
-        )
-    except Exception:
-        pass
+## Usage logging is now handled in openai_utils.py; this helper is deprecated.
 
 
 # ==============================
@@ -374,34 +333,19 @@ Do NOT introduce any new facts, numbers, or achievements.
 Outline:
 {outline}
 """
+    messages = [
+        {"role": "system", "content": "You rewrite text concisely without adding facts. Preserve placeholders exactly."},
+        {"role": "user", "content": prompt.strip()},
+    ]
     try:
-        resp = _openai_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You rewrite text concisely without adding facts. Preserve placeholders exactly."},
-                {"role": "user", "content": prompt.strip()},
-            ],
-            max_tokens=180,
-            temperature=0.2,
-        )
-        _log_chat_usage(resp, model, "ui:04_Generate_From_Jobs:summary")
-        return resp.choices[0].message.content.strip()
+        text, resp = chat_completion(messages, model=model, max_tokens=180, temperature=0.2, context="ui:04_Generate_From_Jobs:summary")
+        return text
     except Exception as e:
         if "invalid model" in str(e).lower():
             fallback = "gpt-4o"
             st.warning(f"Model '{model}' not available; using {fallback} instead.")
-            resp = _openai_client.chat.completions.create(
-                model=fallback,
-                messages=[
-                    {"role": "system", "content": "You rewrite text concisely without adding facts. Preserve placeholders exactly."},
-                    {"role": "user", "content": prompt.strip()},
-                ],
-                max_tokens=180,
-                temperature=0.2,
-            )
-            _log_chat_usage(resp, fallback, "ui:04_Generate_From_Jobs:summary")
-            return resp.choices[0].message.content.strip()
-        # Any other error: just return the offline outline
+            text, resp = chat_completion(messages, model=fallback, max_tokens=180, temperature=0.2, context="ui:04_Generate_From_Jobs:summary")
+            return text
         return outline
 
 def _substitute_placeholders(text, title, years_exp, skills_str, achievement):
@@ -439,36 +383,19 @@ Rules:
 Original:
 {bullet}
 """
+    messages = [
+        {"role": "system", "content": "You rephrase text concisely without adding facts. Obey constraints exactly."},
+        {"role": "user", "content": prompt.strip()},
+    ]
     try:
-        resp = _openai_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You rephrase text concisely without adding facts. Obey constraints exactly."},
-                {"role": "user", "content": prompt.strip()},
-            ],
-            temperature=0.2,
-            max_tokens=120,
-        )
-        _log_chat_usage(resp, model, "ui:04_Generate_From_Jobs:bullets")
-        text = resp.choices[0].message.content.strip()
+        text, resp = chat_completion(messages, model=model, temperature=0.2, max_tokens=120, context="ui:04_Generate_From_Jobs:bullets")
         return re.sub(r"\s+", " ", text)
     except Exception as e:
         if "invalid model" in str(e).lower():
             fallback = "gpt-4o"
             st.warning(f"Model '{model}' not available; using {fallback} instead.")
-            resp = _openai_client.chat.completions.create(
-                model=fallback,
-                messages=[
-                    {"role": "system", "content": "You rephrase text concisely without adding facts. Obey constraints exactly."},
-                    {"role": "user", "content": prompt.strip()},
-                ],
-                temperature=0.2,
-                max_tokens=120,
-            )
-            _log_chat_usage(resp, fallback, "ui:04_Generate_From_Jobs:bullets")
-            text = resp.choices[0].message.content.strip()
+            text, resp = chat_completion(messages, model=fallback, temperature=0.2, max_tokens=120, context="ui:04_Generate_From_Jobs:bullets")
             return re.sub(r"\s+", " ", text)
-        # Any other error → keep original bullet
         return bullet
 
 def maybe_paraphrase_experience_bullets(sections, job_description, use_gpt: bool, model: str):
@@ -542,6 +469,7 @@ fdefs = defaults.get("filters", {})
 
 # Configurable save dir (defaults + ensure exists)
 with st.sidebar:
+    debug_usage_log = st.checkbox("Debug: print OpenAI usage records to console", value=False, key="gen_debug_usage")
     st.header("Options")
     db_path = st.text_input("Database file", value=defaults.get("db", "jobs.db"), key="gen_db_path")
 
@@ -623,30 +551,25 @@ all_candidates = query_top_matches(
     limit=FETCH_CAP,
     min_score=float(threshold),
     hide_stale_days=None,
-) or []
+)
 raw_count = len(all_candidates)
-
 # Remove already-processed jobs early
 all_candidates = [
     c for c in all_candidates
     if int(c.get("not_suitable") or 0) == 0 and int(c.get("submitted") or 0) == 0
 ]
 after_flags = len(all_candidates)
-
 # Apply the SAME saved filters as Jobs Report (incl. location allowlist)
 filtered = apply_saved_filters(all_candidates, fdefs)
-
 # Belt & suspenders—don’t show flagged rows even if filters change later
 filtered = [
     c for c in filtered
     if int(c.get("not_suitable") or 0) != 1 and int(c.get("submitted") or 0) != 1
 ]
 after_filters = len(filtered)
-
 # Keep score ordering, then cap to the user’s requested amount
 filtered.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
 DISPLAY_JOBS = filtered[:requested]
-
 # UI + logs
 st.subheader(
     f"Actionable jobs ≥ threshold — showing {len(DISPLAY_JOBS)} of {after_filters} "
@@ -754,7 +677,7 @@ if DISPLAY_JOBS:
             "company": c.get("company", ""),
             "location": c.get("location", ""),
             "source": c.get("source", ""),
-            "posted_at": c.get("posted_at", ""),
+                "posted_at": format_dt(c.get("posted_at", "")),
             "url": c.get("url", ""),
             "resume": resume_url,
         }
@@ -810,6 +733,7 @@ if DISPLAY_JOBS:
                             "Domain mismatch",
                             "Job function mismatch",
                             "Security clearance/eligibility",
+                            "Education requirements",
                             "Contract only",
                             "Company fit",
                             "Spam/duplicate",
@@ -854,14 +778,28 @@ if DISPLAY_JOBS:
             # Generate → cache it
             if gen_btn:
                 log(f"[generate-click] job_id={job_id} company={company} key={row_key}")
+                # Debug: log all tailoring options
+                debug_options = {
+                    "top_n": (3 if st.session_state.get("gen_order") == "Hybrid" else None),
+                    "use_embeddings": st.session_state.get("gen_use_embed", False),
+                    "ordering": st.session_state.get("gen_order","Relevancy First").lower(),
+                    "embedding_model": st.session_state.get("gen_embed_model") or "text-embedding-3-small",
+                    "add_tailored_summary": st.session_state.get("gen_add_sum", True),
+                    "paraphrase_summary_gpt": st.session_state.get("gen_sum_gpt", False),
+                    "summary_gpt_model": st.session_state.get("gen_sum_model") or "gpt-5.0",
+                    "paraphrase_bullets_gpt": st.session_state.get("gen_gp_bul", False),
+                    "bullets_gpt_model": st.session_state.get("gen_gpt_model") or "gpt-5.0",
+                }
+                print("[DEBUG] Tailoring options:", debug_options)
+                log(f"[DEBUG] Tailoring options: {debug_options}")
                 try:
                     tailored, scores_map = generate_tailored_resume(
                         resume,
                         jd_text,
-                        top_n=(3 if st.session_state.get("gen_order") == "Hybrid" else None),
-                        use_embeddings=st.session_state.get("gen_use_embed", False),
-                        ordering=st.session_state.get("gen_order","Relevancy First").lower(),
-                        embedding_model=(st.session_state.get("gen_embed_model") or "text-embedding-3-small"),
+                        top_n=debug_options["top_n"],
+                        use_embeddings=debug_options["use_embeddings"],
+                        ordering=debug_options["ordering"],
+                        embedding_model=debug_options["embedding_model"],
                     )
                 except Exception as e:
                     st.error(f"Tailoring failed: {e}")
@@ -871,12 +809,14 @@ if DISPLAY_JOBS:
                 # Optional tailored summary (strict)
                 tailored_summary = None
                 try:
-                    if st.session_state.get("gen_add_sum", True):
+                    if debug_options["add_tailored_summary"]:
+                        print(f"[DEBUG] Summary GPT: use_gpt={debug_options['paraphrase_summary_gpt']}, model={debug_options['summary_gpt_model']}")
+                        log(f"[DEBUG] Summary GPT: use_gpt={debug_options['paraphrase_summary_gpt']}, model={debug_options['summary_gpt_model']}")
                         tailored_summary = generate_tailored_summary_strict(
                             resume,
                             jd_text,
-                            use_gpt=st.session_state.get("gen_sum_gpt", False),
-                            model=st.session_state.get("gen_sum_model") or "gpt-5.0"
+                            use_gpt=debug_options["paraphrase_summary_gpt"],
+                            model=debug_options["summary_gpt_model"]
                         )
                 except Exception as e:
                     st.warning(f"Summary generation failed, omitting summary: {e}")
@@ -884,9 +824,11 @@ if DISPLAY_JOBS:
 
                 # Optional GPT paraphrase of bullets with strict guardrails
                 try:
-                    if st.session_state.get("gen_gp_bul", False):
+                    if debug_options["paraphrase_bullets_gpt"]:
+                        print(f"[DEBUG] Bullets GPT: use_gpt=True, model={debug_options['bullets_gpt_model']}")
+                        log(f"[DEBUG] Bullets GPT: use_gpt=True, model={debug_options['bullets_gpt_model']}")
                         tailored = maybe_paraphrase_experience_bullets(
-                            tailored, jd_text, use_gpt=True, model=st.session_state.get("gen_gpt_model") or "gpt-5.0"
+                            tailored, jd_text, use_gpt=True, model=debug_options["bullets_gpt_model"]
                         )
                 except Exception as e:
                     st.warning(f"Bullet paraphrase failed (using unmodified bullets): {e}")
@@ -1046,8 +988,8 @@ def _row_sub(c):
         "company": c.get("company",""),
         "location": c.get("location",""),
         "source": c.get("source",""),
-        "posted_at": c.get("posted_at",""),
-        "submitted_at": c.get("submitted_at",""),
+        "posted_at": format_dt(c.get("posted_at","")),
+        "submitted_at": format_dt(c.get("submitted_at","")),
         "resume_score": (round(float(rs),3) if rs is not None else ""),
         "url": c.get("url",""),
         "resume": resume_url,

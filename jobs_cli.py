@@ -1,3 +1,54 @@
+import dateutil.parser
+from datetime import datetime, timezone
+# --- Date/time migration utility ---
+def normalize_datetime_cli(val):
+    if not val:
+        return None
+    try:
+        if isinstance(val, (int, float)) or (isinstance(val, str) and val.strip().isdigit()):
+            return datetime.fromtimestamp(float(val), tz=timezone.utc).isoformat()
+        dt = dateutil.parser.parse(str(val))
+        if not dt.tzinfo:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+
+def cmd_migrate_datetime_fields(db):
+    con = sqlite3.connect(db)
+    cur = con.execute("PRAGMA table_info(jobs)")
+    columns = [r[1] for r in cur.fetchall()]
+    dt_fields = [c for c in columns if c.endswith('_at') or c in ('posted_at', 'pulled_at', 'created_at', 'updated_at')]
+    cur = con.execute(f"SELECT id, {', '.join(dt_fields)} FROM jobs")
+    jobs = cur.fetchall()
+    updated = 0
+    for job in jobs:
+        id = job[0]
+        updates = {}
+        for idx, field in enumerate(dt_fields, start=1):
+            orig = job[idx]
+            norm = normalize_datetime_cli(orig)
+            if norm and norm != orig:
+                updates[field] = norm
+        if updates:
+            set_clause = ', '.join([f"{k}=?" for k in updates.keys()])
+            vals = list(updates.values()) + [id]
+            con.execute(f"UPDATE jobs SET {set_clause} WHERE id=?", vals)
+            updated += 1
+    con.commit()
+    con.close()
+    print(json.dumps({"db": db, "updated_rows": updated, "fields": dt_fields}))
+def cmd_fix_remoteok_urls(db):
+    con = sqlite3.connect(db)
+    cur = con.execute("""
+        UPDATE jobs
+        SET url = REPLACE(url, 'https://remoteok.comhttps://remoteOK.com/', 'https://remoteok.com/')
+        WHERE source = 'remoteok' AND url LIKE 'https://remoteok.comhttps://remoteOK.com/%';
+    """)
+    affected = cur.rowcount
+    con.commit()
+    con.close()
+    print(json.dumps({"db": db, "fixed_rows": affected}))
 # jobs_cli.py
 import os, sys, sqlite3, argparse, json
 
@@ -94,6 +145,10 @@ if __name__ == "__main__":
     p_search.add_argument("--exact", action="store_true", help="Match exactly (no wildcards added)")
     p_search.add_argument("--show-desc", action="store_true", help="Include a short description snippet")
 
+    sub.add_parser("fix-remoteok-urls", help="Fix malformed RemoteOK URLs in jobs table")
+
+    sub.add_parser("migrate-datetime-fields", help="Normalize all job date/time fields to ISO UTC format")
+
     args = ap.parse_args()
     db = abs_db(args.db)
 
@@ -102,3 +157,7 @@ if __name__ == "__main__":
     elif args.cmd == "schema":       cmd_schema(db)
     elif args.cmd == "search-company":
         cmd_search_company(db, args.query, args.limit, exact=args.exact, show_desc=args.show_desc)
+    elif args.cmd == "fix-remoteok-urls":
+        cmd_fix_remoteok_urls(db)
+    elif args.cmd == "migrate-datetime-fields":
+        cmd_migrate_datetime_fields(db)

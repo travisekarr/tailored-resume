@@ -28,6 +28,7 @@ RESUME_PATH = "modular_resume_full.yaml"
 
 # --- Setup ---
 load_dotenv()
+print("OPENAI_API_KEY:", os.environ.get("OPENAI_API_KEY"))
 client = OpenAI()
 
 # ----- Model/pricing directories -----

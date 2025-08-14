@@ -4,7 +4,7 @@
 
 defaults:
   remote_only: true
-  max_results: 1000
+  max_results: 1500
   dedupe_key: "company|title|canonical_url"
   min_score: 0.0
   fetch_full_descriptions: true   # turn enrichment on/off
@@ -27,9 +27,9 @@ aggregators:
 
   remotive:
     enabled: true
-    queries: ["engineering manager", "platform", "devops"]
+    queries: ["engineering manager", "platform", "devops", "engineer"]
     categories: []
-    limit: 500
+    limit: 1000
 
   remoteok:
     enabled: true
@@ -37,12 +37,13 @@ aggregators:
   weworkremotely:
     enabled: true
     feeds:
+      - https://weworkremotely.com/categories/remote-management-finance-jobs.rss
       - https://weworkremotely.com/remote-programming-jobs.rss
       - https://weworkremotely.com/remote-devops-sysadmin-jobs.rss
       - https://weworkremotely.com/categories/remote-programming-jobs.rss
       - https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss
       - https://weworkremotely.com/categories/remote-data-science-jobs.rss
-
+      - https://weworkremotely.com/categories/remote-management-finance-jobs.rss
   hnrss:
     enabled: true
     feed: https://hnrss.org/jobs
@@ -84,12 +85,16 @@ aggregators:
 
   themuse:
     enabled: false
-    category: "Software Engineering"
-    pages: 2
+    category: 
+    - "Software Engineering"
+    - "Engineering manager"
+    - "DevOps"
+    - "Software Development Manager"
+    pages: 5
 
   findwork:
     enabled: false
-    search: "platform devops manager"
+    search: "platform devops software developer manager"
     limit: 100
     # api_key: YOUR_TOKEN  # or env FINDWORK_API_KEY
 
