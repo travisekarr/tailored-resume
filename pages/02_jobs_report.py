@@ -21,6 +21,7 @@ from job_store import (
     set_job_status,
     clear_jobs_data, 
     nuke_database,
+    query_sections_for_report,
 )
 
 # ====== OPTIONAL: load resume to build profile terms for score debugging ======
@@ -346,7 +347,8 @@ defaults = load_defaults()
 with st.sidebar:
     st.header("Filters")
 
-    db_path = st.text_input("Database file", value=defaults["db"])
+    db_path = st.text_input("Database file", value="jobs.db", key="jr_db")
+    limit_per = st.slider("Max per section", 10, 500, 200, 10, key="jr_limit")
 
     presets = ["24h", "48h", "3d", "7d", "14d", "30d"]
     since_default = defaults["since"]
@@ -603,6 +605,88 @@ def table_rows(rows, cols):
     return [norm_row(r) for r in rows]
 
 # ---------- New since ----------
+# ================== Sectioned lists (status & flags) ==================
+st.markdown("---")
+st.subheader("📌 Sectioned lists")
+
+# Pull all 4 sections with one call
+sections = query_sections_for_report(db_path=db_path, limit_per=int(limit_per))
+
+# Quick counts
+st.write(
+    f"**Counts** — "
+    f"Actionable: `{len(sections.get('actionable', []))}` · "
+    f"Saved: `{len(sections.get('saved', []))}` · "
+    f"Submitted: `{len(sections.get('submitted', []))}` · "
+    f"Not suitable: `{len(sections.get('not_suitable', []))}`"
+)
+
+tabA, tabS, tabSub, tabNS = st.tabs(["Actionable", "Saved", "Submitted", "Not suitable"])
+
+def _prep_section_df(rows):
+    import pandas as _pd
+    df = _pd.DataFrame(rows or [])
+    if df.empty:
+        return df
+
+    # unify id
+    if "job_id" not in df.columns and "id" in df.columns:
+        df["job_id"] = df["id"]
+
+    # coerce booleans / numerics
+    for b in ("remote", "submitted", "not_suitable"):
+        if b in df.columns:
+            # handle 0/1, None, strings
+            df[b] = df[b].apply(lambda x: bool(int(x)) if isinstance(x, (int, str)) and str(x).isdigit() else bool(x))
+
+    for n in ("score", "resume_score"):
+        if n in df.columns:
+            df[n] = pd.to_numeric(df[n], errors="coerce")
+
+    # make Arrow-friendly for Streamlit
+    df = make_arrow_friendly(df)
+    return df
+
+def _render_section(rows):
+    df = _prep_section_df(rows)
+    if df.empty:
+        st.info("No rows.")
+        return
+
+    # keep only columns that exist to avoid KeyErrors
+    desired_cols = [
+        "job_id", "score", "title", "company", "location", "remote", "source",
+        "posted_at", "submitted", "submitted_at", "not_suitable", "not_suitable_at",
+        "url", "resume_path", "resume_score"
+    ]
+    show_cols = [c for c in desired_cols if c in df.columns]
+
+    st.dataframe(
+        df[show_cols],
+        use_container_width=True,
+        height=420,
+        column_config={
+            "remote": st.column_config.CheckboxColumn("Remote"),
+            "submitted": st.column_config.CheckboxColumn("Submitted"),
+            "not_suitable": st.column_config.CheckboxColumn("Not suitable"),
+            "url": st.column_config.LinkColumn("URL", display_text="Open"),
+            # keep resume_path as plain text (file:// varies by browser); remove if you prefer
+        },
+    )
+
+with tabA:
+    _render_section(sections.get("actionable"))
+
+with tabS:
+    _render_section(sections.get("saved"))
+
+with tabSub:
+    _render_section(sections.get("submitted"))
+
+with tabNS:
+    _render_section(sections.get("not_suitable"))
+# ================== /Sectioned lists ==================
+
 st.subheader("🆕 New since window")
 if NEW_f:
     df_new = pd.DataFrame(table_rows(
@@ -733,6 +817,17 @@ with st.expander("Score distribution (Top + New + Latest)"):
         st.caption(f"Min: {min(scores):.3f} | Median: {np.median(scores):.3f} | Max: {max(scores):.3f}")
     else:
         st.write("No scores to show.")
+
+def _arrow(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return df
+    for c in df.columns:
+        lc = c.lower()
+        if lc in ("id","job_id"): df[c] = df[c].astype("string")
+        elif lc in ("posted_at","first_seen","last_seen","pulled_at","created_at","updated_at","submitted_at","not_suitable_at"):
+            df[c] = df[c].astype("string")
+        elif lc in ("score","resume_score"): df[c] = pd.to_numeric(df[c], errors="coerce")
+        elif df[c].dtype == "object": df[c] = df[c].astype("string")
+    return df
 
 # ================== NEW: Score Debugger ==================
 st.markdown("---")

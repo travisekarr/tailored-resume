@@ -10,6 +10,7 @@ import requests
 import feedparser
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple, Optional
+from collections import Counter, defaultdict
 
 import yaml
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -63,6 +64,13 @@ def _cosine(a, b):
     return (num / (da * db)) if da and db else 0.0
 
 def _log(logs: list, msg: str, data: Optional[dict] = None):
+    if "enrich.skip" not in msg:
+        log_entry = {"ts": utcnow(), "msg": msg, "data": data or {}}
+        if "error" in msg.lower():
+            # ANSI escape code for bright red
+            print(f"\033[91m{log_entry}\033[0m")
+        else:
+            print(log_entry)
     logs.append({"ts": utcnow(), "msg": msg, "data": data or {}})
 
 def _getenv_or(cfg: dict, key: str, env: str) -> Optional[str]:
@@ -117,6 +125,21 @@ def _stringify(x) -> str:
     if isinstance(x, (list, tuple, set)):
         return " ".join(_stringify(v) for v in x)
     return str(x)
+
+def _is_remote(it: dict) -> bool:
+    """Best-effort remote detector across noisy feeds."""
+    val = str(it.get("remote", "")).strip().lower()
+    if val in ("true", "1", "yes", "y"):  # explicit truthy
+        return True
+    # fallbacks
+    loc  = (it.get("location") or "").lower()
+    tit  = (it.get("title") or "").lower()
+    desc = (it.get("description") or "").lower()
+    needles = ("remote", "anywhere", "worldwide", "work from home")
+    if any(n in loc for n in needles): return True
+    if "remote" in tit: return True
+    if "remote" in desc: return True
+    return False
 
 # -----------------------------
 # YAML loader (with legacy support)
@@ -210,8 +233,6 @@ def _build_resume_text(resume_yaml_path: str) -> str:
 # -----------------------------
 # Scoring helpers
 # -----------------------------
-from sklearn.feature_extraction.text import TfidfVectorizer
-
 def _score_tfidf(resume_text: str, job_texts: list[str]) -> list[float]:
     """
     Stronger TF-IDF:
@@ -237,25 +258,54 @@ def _score_tfidf(resume_text: str, job_texts: list[str]) -> list[float]:
 # RSS helper
 # -----------------------------
 def fetch_rss(feed_url: str, source: str, logs: list) -> List[dict]:
-    _log(logs, "rss.fetch", {"url": feed_url})
-    try:
-        f = feedparser.parse(feed_url)
-    except Exception as e:
-        print(f"Error parsing RSS feed: {e}")
-        _log(logs, "rss.parse_error", {"url": feed_url, "error": str(e)})
+    """Fetch RSS with browser-like headers, then parse; logs entry counts; handles WWR 'Company: Title'."""
+    _log(logs, "rss.fetch", {"url": feed_url, "source": source})
+    r, err = _http_get(
+        feed_url,
+        logs,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+        },
+        timeout=25,
+    )
+    if not r or r.status_code != 200:
+        _log(logs, "rss.http_fail", {
+            "url": feed_url, "source": source, "status": getattr(r, "status_code", None), "error": err
+        })
         return []
+
+    try:
+        f = feedparser.parse(r.content)  # parse the bytes we fetched
+    except Exception as e:
+        _log(logs, "rss.parse_error", {"url": feed_url, "source": source, "error": str(e)})
+        return []
+
+    entries = getattr(f, "entries", []) or []
+    _log(logs, "rss.entries", {"source": source, "url": feed_url, "count": len(entries)})
+
     out: List[dict] = []
-    for e in f.entries:
+    for e in entries:
         url = e.get("link") or ""
         desc = e.get("summary") or e.get("description") or ""
-        title = e.get("title") or ""
-        company = ""
-        m = re.search(r" at ([^-–—]+)", title)
-        if m:
-            company = m.group(1).strip()
+        title_raw = e.get("title") or ""
         posted = e.get("published") or e.get("updated") or None
+
+        title = title_raw
+        company = ""
+
+        if source == "weworkremotely":
+            # WWR pattern is commonly "Company: Role"
+            parts = [p.strip() for p in title_raw.split(": ", 1)]
+            if len(parts) == 2:
+                company, title = parts[0], parts[1]
+        else:
+            m = re.search(r" at ([^-–—]+)", title_raw)
+            if m:
+                company = m.group(1).strip()
+
         out.append({
-            "id": _hash_id(url or title),
+            "id": _hash_id(url or title_raw),
             "title": title,
             "company": company,
             "location": "",
@@ -267,7 +317,6 @@ def fetch_rss(feed_url: str, source: str, logs: list) -> List[dict]:
             "description": desc,
         })
     return out
-
 
 def _log_openai_usage_resp(resp, *, endpoint: str, model: str, context: str = "cli", db_path: str | None = None):
     try:
@@ -294,13 +343,13 @@ def _log_openai_usage_resp(resp, *, endpoint: str, model: str, context: str = "c
 
 # ---------- Embedding batching helpers ----------
 # Safe budgets; tweak down if you still see "max_tokens_per_request"
-_EMBED_REQ_TOKEN_BUDGET = 250_000      # per request (below the 300k hard cap)
-_MAX_CHARS_PER_INPUT   = 8_000         # ~2k tokens (roughly 4 chars/token); trims very long JDs
-
-# If you already have a global OpenAI client named _openai_client in this file, we reuse it.
+_EMBED_REQ_TOKEN_BUDGET = 160_000     # effective budget per request (<< 300k)
+_MAX_INPUTS_PER_BATCH   = 96          # hard cap on items per batch
+_MAX_CHARS_PER_INPUT    = 4_000       # reduce per-input length to keep requests small
+_SAFETY_FACTOR          = 1.35        # multiply estimates to be conservative
 
 def _estimate_tokens(text: str, model: str = "text-embedding-3-small") -> int:
-    """Rough token estimate. Uses tiktoken if available, falls back to 4 chars/token."""
+    """Conservative token estimate. Uses tiktoken if available; else ~3 chars/token."""
     s = text or ""
     if _tiktoken:
         try:
@@ -308,46 +357,37 @@ def _estimate_tokens(text: str, model: str = "text-embedding-3-small") -> int:
         except Exception:
             enc = _tiktoken.get_encoding("cl100k_base")
         return len(enc.encode(s))
-    # crude heuristic
-    return max(1, (len(s) // 4) + 1)
+    # Conservative heuristic (smaller divisor => larger estimate)
+    return max(1, (len(s) // 3) + 1)
 
 def _clean_for_embedding(s) -> str:
-    """
-    Normalize arbitrary input to a clean, space-separated string
-    suitable for embeddings/TF-IDF.
-    """
-    # Force to string first (avoids TypeError when dict/list/None leaks in)
     s = _stringify(s)
-
-    # Unescape entities, strip tags & code fences, collapse whitespace
     s = _html.unescape(s)
-    s = _re.sub(r"<[^>]+>", " ", s)                     # remove HTML tags
-    s = _re.sub(r"`{3,}.*?`{3,}", " ", s, flags=_re.S)  # remove ```code``` blocks
-    s = _re.sub(r"`([^`]+)`", r"\1", s)                 # inline code ticks
+    s = _re.sub(r"<[^>]+>", " ", s)
+    s = _re.sub(r"`{3,}.*?`{3,}", " ", s, flags=_re.S)
+    s = _re.sub(r"`([^`]+)`", r"\1", s)
     s = _re.sub(r"[ \t\r\f\v]+", " ", s)
     s = _re.sub(r"\s*\n+\s*", "\n", s)
     s = s.strip().lower()
-
-    # Hard-trim very long inputs to keep embedding requests modest
     if len(s) > _MAX_CHARS_PER_INPUT:
         s = s[:_MAX_CHARS_PER_INPUT]
     return s
 
-def _chunk_by_token_budget(texts: list[str], model: str, budget: int) -> list[list[str]]:
-    """Split texts into batches whose combined token estimate stays under budget."""
-    batches, current, current_tokens = [], [], 0
+def _chunk_by_token_budget(texts: list[str], model: str, budget: int, max_items: int) -> list[list[str]]:
+    """Split texts into batches under (budget / SAFETY_FACTOR) and <= max_items."""
+    batches, current, current_est = [], [], 0
+    eff_budget = int(budget / _SAFETY_FACTOR)
     for t in texts:
         tt = _estimate_tokens(t, model)
-        # if single item exceeds budget, still send alone (API will handle per-input limits)
-        if current and current_tokens + tt > budget:
+        # cut the batch if adding this item would exceed budget or max_items
+        if current and (current_est + tt > eff_budget or len(current) >= max_items):
             batches.append(current)
-            current, current_tokens = [], 0
+            current, current_est = [], 0
         current.append(t)
-        current_tokens += tt
+        current_est += tt
     if current:
         batches.append(current)
     return batches
-
 
 def _cosine_sim(vec_a, vec_b) -> float:
     num = sum(a*b for a, b in zip(vec_a, vec_b))
@@ -359,42 +399,86 @@ def _score_embeddings(
     resume_text: str,
     job_texts: list[str],
     embedding_model: str = "text-embedding-3-small",
+    logs: list | None = None,
 ) -> list[float]:
-    """
-    Robust embedding-based scoring:
-      - cleans & trims each input
-      - embeds resume once
-      - embeds jobs in token-budgeted batches
-      - returns cosine similarity scores aligned to job_texts order
-    """
+    """Embedding-based scoring with strict batching and recursive split on 300k-cap errors."""
     if _openai_client is None:
-        # OpenAI client not available → no-op scores
         return [0.0] * len(job_texts)
 
-    # 1) Clean & trim
+    # 1) Clean inputs
     resume_clean = _clean_for_embedding(resume_text or "")
     jobs_clean   = [_clean_for_embedding(t or "") for t in job_texts]
 
-    # 2) Embed resume once (fallback if model is invalid for the org)
+    if not embedding_model or not isinstance(embedding_model, str):
+        raise ValueError(f"Embedding model missing/invalid: {embedding_model!r}")
+    if not embedding_model.startswith("text-embedding-"):
+        raise ValueError(f"Not an embeddings model: {embedding_model}")
+
+    # 2) Embed resume once (retry on model mismatch with -3-small)
     try:
         res = _openai_client.embeddings.create(model=embedding_model, input=resume_clean)
-    except Exception as e:
-        print(f"Error embedding resume: {e}")
+    except Exception:
+        res = _openai_client.embeddings.create(model="text-embedding-3-small", input=resume_clean)
         embedding_model = "text-embedding-3-small"
-        res = _openai_client.embeddings.create(model=embedding_model, input=resume_clean)
     resume_vec = res.data[0].embedding
 
-    # 3) Batch-embed jobs
-    try:
-        resp = _openai_client.embeddings.create(model=embedding_model, input=jobs_clean)
-        job_vecs = [d.embedding for d in resp.data]
-    except Exception as e:
-        print(f"Error embedding jobs: {e}")
-        # last-ditch retry with small model
-        resp = _openai_client.embeddings.create(model="text-embedding-3-small", input=jobs_clean)
-        job_vecs = [d.embedding for d in resp.data]
+    # 3) Prepare batches
+    batches = _chunk_by_token_budget(
+        jobs_clean, model=embedding_model,
+        budget=_EMBED_REQ_TOKEN_BUDGET, max_items=_MAX_INPUTS_PER_BATCH
+    )
+    if logs is not None:
+        _log(logs, "embeddings.start", {"model": embedding_model, "jobs": len(jobs_clean), "batches": len(batches)})
 
-    # 4) Cosine similarities
+    job_vecs: list[list[float]] = []
+
+    def _embed_batch(texts: list[str]) -> list[list[float]]:
+        # try whole batch
+        est = sum(_estimate_tokens(t, embedding_model) for t in texts)
+        if logs is not None:
+            _log(logs, "embeddings.batch", {
+                "model": embedding_model, "batch_size": len(texts), "est_tokens": int(est * _SAFETY_FACTOR)
+            })
+        try:
+            resp = _openai_client.embeddings.create(model=embedding_model, input=texts)
+            return [d.embedding for d in resp.data]
+        except Exception as e:
+            msg = str(e)
+            # If we hit the token cap, split and recurse
+            if ("max_tokens_per_request" in msg) or ("max 300000 tokens" in msg):
+                if logs is not None:
+                    _log(logs, "embeddings.batch.split", {
+                        "reason": "max_tokens_per_request", "size": len(texts), "est_tokens": int(est * _SAFETY_FACTOR)
+                    })
+                if len(texts) == 1:
+                    # last-ditch: hard-trim further and try once more
+                    t0 = texts[0][: max(1000, _MAX_CHARS_PER_INPUT // 2)]
+                    try:
+                        resp2 = _openai_client.embeddings.create(model=embedding_model, input=t0)
+                        return [resp2.data[0].embedding]
+                    except Exception:
+                        # fallback tiny vector of zeros to keep alignment
+                        return [[0.0] * len(resume_vec)]
+                mid = len(texts) // 2
+                left  = _embed_batch(texts[:mid])
+                right = _embed_batch(texts[mid:])
+                return left + right
+            # Other errors: rethrow (handled by caller to fall back TF-IDF if desired)
+            raise
+
+    # 4) Embed all batches in order
+    try:
+        for b in batches:
+            job_vecs.extend(_embed_batch(b))
+        if logs is not None:
+            _log(logs, "embeddings.ok", {"model": embedding_model, "vectors": len(job_vecs)})
+    except Exception as e:
+        if logs is not None:
+            _log(logs, "embeddings.error", {"model": embedding_model, "error": str(e)})
+        # Fallback to TF-IDF on any unexpected failure
+        return _score_tfidf(resume_text, job_texts)
+
+    # 5) Cosine similarities
     def _cos(a, b):
         num = sum(x*y for x, y in zip(a, b))
         da = sum(x*x for x in a) ** 0.5
@@ -403,7 +487,7 @@ def _score_embeddings(
 
     scores = [_cos(resume_vec, v) for v in job_vecs]
 
-    # 5) Length alignment
+    # 6) Align lengths
     if len(scores) != len(job_texts):
         if len(scores) < len(job_texts):
             scores += [0.0] * (len(job_texts) - len(scores))
@@ -502,19 +586,40 @@ def fetch_remotive(cfg: dict, logs: list) -> List[dict]:
 def fetch_weworkremotely(cfg: dict, logs: list) -> List[dict]:
     if not cfg.get("enabled"):
         return []
-    feeds = cfg.get("feeds") or ["https://weworkremotely.com/remote-jobs.rss"]
+    feeds = cfg.get("feeds") or [
+        "https://weworkremotely.com/remote-jobs.rss",
+        "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+        "https://weworkremotely.com/categories/remote-data-science-jobs.rss",
+        "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",
+        "https://weworkremotely.com/categories/remote-product-jobs.rss",
+    ]
     results: List[dict] = []
 
     for u in feeds:
-        _log(logs, "rss.fetch", {"url": u, "source": "weworkremotely"})
+        # fetch with headers, then parse bytes (more reliable)
+        r, _ = _http_get(
+            u,
+            logs,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
+            },
+            timeout=25,
+        )
+        if not r or r.status_code != 200:
+            _log(logs, "rss.http_fail", {"url": u, "source": "weworkremotely", "status": getattr(r, "status_code", None)})
+            continue
         try:
-            f = feedparser.parse(u)
+            f = feedparser.parse(r.content)
         except Exception as e:
-            print(f"Error parsing weworkremotely RSS: {e}")
-            _log(logs, "rss.parse_error", {"url": u, "error": str(e), "source": "weworkremotely"})
+            print(f"Error parsing WWR RSS: {e}")
+            _log(logs, "rss.parse_error", {"url": u, "source": "weworkremotely", "error": str(e)})
             continue
 
-        for e in f.entries:
+        entries = getattr(f, "entries", []) or []
+        _log(logs, "rss.entries", {"source": "weworkremotely", "url": u, "count": len(entries)})
+
+        for e in entries:
             url = e.get("link") or ""
             title_raw = (e.get("title") or "").strip()
             desc = e.get("summary") or e.get("description") or ""
@@ -528,13 +633,11 @@ def fetch_weworkremotely(cfg: dict, logs: list) -> List[dict]:
                 left, right = title_raw.split(":", 1)
                 if left.strip() and right.strip():
                     company, title = left.strip(), right.strip()
-
             # Optional fallback if some feeds use a semicolon
             elif ";" in title_raw:
                 left, right = title_raw.split(";", 1)
                 if left.strip() and right.strip():
                     company, title = left.strip(), right.strip()
-
             else:
                 # Fallback: "... at Company"
                 m = re.search(r"\bat\s+([^-–—\|]+)$", title_raw, flags=re.I)
@@ -554,7 +657,6 @@ def fetch_weworkremotely(cfg: dict, logs: list) -> List[dict]:
                 "pulled_at": utcnow(),
                 "description": desc,
             })
-
     return results
 
 def fetch_hnrss(cfg: dict, logs: list) -> List[dict]:
@@ -876,7 +978,7 @@ def fetch_lever(cfg: dict, logs: list) -> List[dict]:
 def fetch_workable(cfg: dict, logs: list) -> List[dict]:
     if not cfg.get("enabled"):
         return []
-    accounts = cfg.get("accounts") or []  # subdomains
+    accounts = cfg.get("accounts") or [] # subdomains
     out: List[dict] = []
     for acc in accounts:
         url = f"https://apply.workable.com/api/v3/accounts/{acc}/jobs"
@@ -1099,8 +1201,6 @@ def _enrich_items_descriptions(items: List[dict], defaults: dict, logs: list) ->
         else:
             _log(logs, "enrich.fail", {"url": url, "got_chars": len(text or '')})
 
-import re
-
 def _tokenize_words(s: str) -> set[str]:
     return {w.lower() for w in re.findall(r"[a-z0-9+\-/#\.]{3,}", s or "")}
 
@@ -1234,6 +1334,7 @@ def hunt_jobs(
         if not isinstance(acfg, dict) or not acfg.get("enabled"):
             continue
         try:
+            before = len(items)
             if name == "remotive":
                 items.extend(fetch_remotive(acfg, logs))
             elif name == "remoteok":
@@ -1272,63 +1373,89 @@ def hunt_jobs(
                 items.extend(fetch_generic_rss(acfg, logs))
             else:
                 _log(logs, "aggregator.unknown", {"name": name})
+            added = len(items) - before
+            _log(logs, "agg.results", {"source": name, "count": added})
         except Exception as e:
             print(f"Error fetching jobs from aggregator {name}: {e}")
             _log(logs, "aggregator.error", {"name": name, "error": str(e)})
 
-    raw_total = len(items)
+    # ------ STAGE 0: collect raw + per-source raw counts
+    all_items = items[:]  # keep original
+    raw_total = len(all_items)
+    raw_counts = Counter((it.get("source") or "unknown") for it in all_items)
 
-    # Remote filter
+    # ------ STAGE 1: remote-only filter (robust)
     if remote_only:
-        items = [it for it in items if it.get("remote") in (True, "true", 1)]
-    after_remote = len(items)
+        s1_items = [it for it in all_items if _is_remote(it)]
+    else:
+        s1_items = all_items[:]
+    after_remote = len(s1_items)
+    s1_counts = Counter((it.get("source") or "unknown") for it in s1_items)
 
-    def _s(x):
+    # ------ STAGE 2: include/exclude keyword filters
+    def _s(x):  # (kept from your code)
         return x if isinstance(x, str) else ("" if x is None else str(x))
 
-    # Include/exclude filters
-    def ok_by_filters(it: dict) -> bool:
+    def ok_by_filters(it: dict) -> bool:  # (kept from your code)
         t = " ".join([_s(it.get("title")), _s(it.get("company")), _s(it.get("description"))]).lower()
         if include and not any(s in t for s in include):
             return False
         if exclude and any(s in t for s in exclude):
             return False
         return True
-    items = [it for it in items if ok_by_filters(it)]
-    after_keywords = len(items)
 
-    # De-dupe by URL or (company|title)
+    s2_items = [it for it in s1_items if ok_by_filters(it)]
+    after_keywords = len(s2_items)
+    s2_counts = Counter((it.get("source") or "unknown") for it in s2_items)
+
+    # ------ STAGE 3: de-dupe
     seen = set()
-    deduped: List[dict] = []
-    for it in items:
-        key = (it.get("url") or "").lower() or (it.get("company","").lower() + "|" + it.get("title","").lower())
+    deduped = []
+    per_source_after_dedupe = defaultdict(int)
+    for it in s2_items:
+        key = (it.get("url") or "").lower() or ((it.get("company","") + "|" + it.get("title","")).lower())
         if key in seen:
             continue
         seen.add(key)
         deduped.append(it)
+        per_source_after_dedupe[it.get("source") or "unknown"] += 1
     items = deduped
     after_dedupe = len(items)
 
-    # Enrich descriptions if enabled
+    # ------ (optional) enrichment
     if bool(defaults.get("fetch_full_descriptions", False)):
         _log(logs, "enrich.start", defaults.get("enrichment") or {})
         _enrich_items_descriptions(items, defaults, logs)
 
-    # Score against resume
-    # --- scoring ---
+    # ------ STAGE 4: scoring
     resume_text = _build_resume_text(resume_path)
     resume_terms = _extract_resume_keywords(resume_path)
 
     # Build job texts (boost titles implicitly by putting them first & twice)
     job_texts = [f"{it.get('title',' ')} {it.get('title',' ')} — {it.get('description','')}" for it in items]
 
-    tfidf_scores = _score_tfidf(resume_text, job_texts) if not use_embeddings else _score_embeddings(
-        [f"{it.get('title','')} — {it.get('description','')}" for it in items],
-        embedding_model,
-        resume_text
-    )
+    if use_embeddings:
+        plain_job_texts = [f"{it.get('title','')} — {it.get('description','')}" for it in items]
+        _log(logs, "embeddings.start", {
+            "model": embedding_model,
+            "jobs": len(plain_job_texts)
+        })
+        try:
+            scores = _score_embeddings(
+                resume_text=resume_text,
+                job_texts=plain_job_texts,
+                embedding_model=embedding_model,
+                logs=logs,  # <- so you see per-batch logs
+            )
+            tfidf_scores = scores
+            _log(logs, "embeddings.ok", {"model": embedding_model, "scores": len(tfidf_scores)})
+        except Exception as e:
+            _log(logs, "embeddings.error", {"model": embedding_model, "error": str(e)})
+            # graceful fallback
+            tfidf_scores = _score_tfidf(resume_text, job_texts)
+    else:
+        tfidf_scores = _score_tfidf(resume_text, job_texts)
 
-    # Per-source tiny prior (optional)
     source_prior = {
         "greenhouse": 0.02, "lever": 0.02, "workable": 0.01,
         "remoteok": 0.02, "remotive": 0.02, "weworkremotely": 0.02,
@@ -1341,28 +1468,51 @@ def hunt_jobs(
         desc = it.get("description", "")
         title_terms = _overlap_terms(title, resume_terms, k=10)
         desc_terms  = _overlap_terms(desc,  resume_terms, k=10)
-        # Simple boosts: reward matches in title more than in body
-        title_boost = min(0.30, 0.05 * len(title_terms))   # up to +0.30
-        body_boost  = min(0.15, 0.02 * len(desc_terms))    # up to +0.15
+        title_boost = min(0.30, 0.05 * len(title_terms))
+        body_boost  = min(0.15, 0.02 * len(desc_terms))
         prior       = source_prior.get((it.get("source") or "").lower(), 0.0)
-
         final = 0.70 * float(base) + 0.25 * title_boost + 0.05 * (body_boost + prior)
-
+        it = dict(it)
         it["score"] = float(final)
         it["match_terms_title"] = title_terms
         it["match_terms_body"]  = desc_terms
         it["id"] = it.get("id") or _hash_id((it.get("url") or it.get("title","")))
         scored.append(it)
 
-    items = scored
-
-    # Threshold + cap
-    items = [it for it in items if it.get("score", 0.0) >= min_score]
+    # ------ STAGE 5: threshold + cap
+    items = [it for it in scored if it.get("score", 0.0) >= min_score]
     items.sort(key=lambda x: (-x.get("score", 0.0), (x.get("posted_at") or "")))
     if max_results and len(items) > max_results:
         items = items[:max_results]
     after_threshold = len(items)
 
+    # per-source counts after threshold
+    s5_counts = Counter((it.get("source") or "unknown") for it in items)
+
+    # ------ LOG PER-SOURCE STAGE COUNTS
+    all_sources = set(raw_counts) | set(s1_counts) | set(s2_counts) | set(per_source_after_dedupe) | set(s5_counts)
+    for src in sorted(all_sources):
+        _log(logs, "stage.counts.source", {
+            "source": src,
+            "raw_total": int(raw_counts.get(src, 0)),
+            "after_remote_filter": int(s1_counts.get(src, 0)),
+            "after_keyword_filters": int(s2_counts.get(src, 0)),
+            "after_dedupe": int(per_source_after_dedupe.get(src, 0)),
+            "after_threshold": int(s5_counts.get(src, 0)),
+        })
+
+    # ------ LOG GLOBAL STAGE COUNTS
+    _log(logs, "stage.counts", {
+        "raw_total": raw_total,
+        "after_remote_filter": after_remote,
+        "after_keyword_filters": after_keywords,
+        "after_dedupe": after_dedupe,
+        "after_threshold": after_threshold,
+        "min_score": min_score,
+        "remote_only": remote_only,
+    })
+
+    # ------ STATS + RESULT
     stats = {
         "raw_total": raw_total,
         "after_remote_filter": after_remote,
@@ -1371,8 +1521,8 @@ def hunt_jobs(
         "after_threshold": after_threshold,
         "enriched": len([it for it in items if it.get("description_source") == "enriched"]),
     }
-
     _log(logs, "done", {"stats": stats})
+
     res = {
         "generated_at": utcnow(),
         "count": len(items),
@@ -1385,9 +1535,6 @@ def hunt_jobs(
         "sources_yaml": sources_yaml,
     }
     if logger:
-        try:
-            logger("hunt_jobs.complete", res)
-        except Exception as e:
-            print(f"Error calling logger in hunt_jobs: {e}")
-            pass
+        try: logger("hunt_jobs.complete", res)
+        except Exception: pass
     return res

@@ -37,14 +37,40 @@ def _http_events_from_logs(logs):
     for ev in logs or []:
         tag = ev.get("msg", "")
         d = ev.get("data", {}) or {}
-        if tag in ("http.get", "http.error") or tag.startswith("probe.") or tag.startswith("yaml."):
+        if (
+            tag in (
+                "http.get", "http.error",
+                "rss.fetch", "rss.http_fail", "rss.entries",
+                "agg.results",
+                "stage.counts", "stage.counts.source"
+            )
+            or tag.startswith("probe.")
+            or tag.startswith("yaml.")
+            or tag.startswith("embeddings.")
+        ):
             rows.append({
-                "when": _safe_str(ev.get("ts", "")),
-                "tag": _safe_str(tag),
-                "status": _safe_str(d.get("status")),
-                "reason": _safe_str(d.get("reason") or d.get("error")),
-                "len": _safe_str(d.get("len")),
-                "url": _safe_str(d.get("url")),
+                "when": ev.get("ts", ""),
+                "tag": tag,
+                "source": d.get("source"),
+                "status": d.get("status"),
+                "reason": d.get("reason") or d.get("error"),
+                "len": d.get("len"),
+                "url": d.get("url"),
+                "count": d.get("count"),
+                "raw_total": d.get("raw_total"),
+                "after_remote": d.get("after_remote_filter"),
+                "after_keywords": d.get("after_keyword_filters"),
+                "after_dedupe": d.get("after_dedupe"),
+                "after_threshold": d.get("after_threshold"),
+                "min_score": d.get("min_score"),
+                "remote_only": d.get("remote_only"),
+                "model": d.get("model"),   # <-- NEW: see which model was used
+                "jobs": d.get("jobs"),     # <-- NEW: how many inputs we sent
+                "scores": d.get("scores"), # <-- NEW: embeddings.ok count
+                "batch_index": d.get("batch_index"),
+                "batch_size": d.get("batch_size"),
+                "est_tokens": d.get("est_tokens"),
+                "budget": d.get("budget"),
             })
     return rows
 

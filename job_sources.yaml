@@ -39,6 +39,9 @@ aggregators:
     feeds:
       - https://weworkremotely.com/remote-programming-jobs.rss
       - https://weworkremotely.com/remote-devops-sysadmin-jobs.rss
+      - https://weworkremotely.com/categories/remote-programming-jobs.rss
+      - https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss
+      - https://weworkremotely.com/categories/remote-data-science-jobs.rss
 
   hnrss:
     enabled: true

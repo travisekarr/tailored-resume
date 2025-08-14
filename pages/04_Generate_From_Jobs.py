@@ -566,12 +566,12 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Tailoring Options")
-    ordering_mode = st.radio("Experience Ordering", ("Relevancy First", "Chronological", "Hybrid"), index=0, key="gen_order")
+    ordering_mode = st.radio("Experience Ordering", ("Relevancy First", "Chronological", "Hybrid"), index=1, key="gen_order")
     top_n_hybrid = 3
     if ordering_mode == "Hybrid":
         top_n_hybrid = st.slider("Top relevant items before chronological", 1, 10, 3, key="gen_topN")
 
-    use_embeddings = st.checkbox("Use semantic matching (embeddings)", value=False, key="gen_use_embed")
+    use_embeddings = st.checkbox("Use semantic matching (embeddings)", value=True, key="gen_use_embed")
     embed_model = _model_selectbox(
         "Embeddings model",
         group="embeddings",
@@ -581,7 +581,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Rephrasing (no new facts)")
-    gpt_paraphrase_bullets = st.checkbox("Paraphrase bullets to match JD wording (GPT)", value=False, key="gen_gp_bul")
+    gpt_paraphrase_bullets = st.checkbox("Paraphrase bullets to match JD wording (GPT)", value=True, key="gen_gp_bul")
     gpt_model = _model_selectbox(
         "GPT model for rephrasing",
         group="chat",
@@ -594,7 +594,7 @@ with st.sidebar:
     add_tailored_summary = st.checkbox("Include tailored summary section", value=True, key="gen_add_sum")
     gpt_paraphrase_summary = st.checkbox(
         "Use GPT to paraphrase summary (strict placeholders, no new facts)",
-        value=False,
+        value=True,
         key="gen_sum_gpt",
         disabled=not add_tailored_summary
     )
@@ -614,29 +614,46 @@ with st.sidebar:
 st.session_state["resume_save_dir"] = resolved_dir
 
 # Fetch candidates ≥ threshold (exclude not_suitable/submitted early if columns exist)
-CANDIDATES = query_top_matches(
+# ===== Fetch a generous pool, then filter & finally cap to the UI limit =====
+requested = int(limit)
+FETCH_CAP = max(requested * 6, 300)  # pull plenty so filters don't starve the list
+
+all_candidates = query_top_matches(
     defaults.get("db", "jobs.db"),
-    limit=int(limit),
+    limit=FETCH_CAP,
     min_score=float(threshold),
-    hide_stale_days=None
-)
-CANDIDATES = [
-    c for c in CANDIDATES
+    hide_stale_days=None,
+) or []
+raw_count = len(all_candidates)
+
+# Remove already-processed jobs early
+all_candidates = [
+    c for c in all_candidates
     if int(c.get("not_suitable") or 0) == 0 and int(c.get("submitted") or 0) == 0
 ]
-CANDIDATES = [c for c in CANDIDATES if (c.get("score") or 0.0) >= float(threshold)]
+after_flags = len(all_candidates)
 
 # Apply the SAME saved filters as Jobs Report (incl. location allowlist)
-DISPLAY_JOBS = apply_saved_filters(CANDIDATES, fdefs)
+filtered = apply_saved_filters(all_candidates, fdefs)
 
-# Remove rows that are already marked as not suitable or submitted
-DISPLAY_JOBS = [
-    c for c in DISPLAY_JOBS
+# Belt & suspenders—don’t show flagged rows even if filters change later
+filtered = [
+    c for c in filtered
     if int(c.get("not_suitable") or 0) != 1 and int(c.get("submitted") or 0) != 1
 ]
+after_filters = len(filtered)
 
-st.subheader(f"Actionable jobs ≥ threshold after filters ({len(DISPLAY_JOBS)})")
-log(f"[candidates] raw={len(CANDIDATES)} filtered={len(DISPLAY_JOBS)} threshold={threshold}")
+# Keep score ordering, then cap to the user’s requested amount
+filtered.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+DISPLAY_JOBS = filtered[:requested]
+
+# UI + logs
+st.subheader(
+    f"Actionable jobs ≥ threshold — showing {len(DISPLAY_JOBS)} of {after_filters} "
+    f"(from {raw_count} pulled)"
+)
+log(f"[candidates] pulled={raw_count} after_flags={after_flags} "
+    f"after_filters={after_filters} requested={requested} shown={len(DISPLAY_JOBS)}")
 
 # Jinja2 template (once)
 env = Environment(loader=FileSystemLoader("."))
@@ -791,10 +808,14 @@ if DISPLAY_JOBS:
                             "Location/onsite requirement",
                             "Comp/level misaligned",
                             "Domain mismatch",
+                            "Job function mismatch",
                             "Security clearance/eligibility",
                             "Contract only",
                             "Company fit",
                             "Spam/duplicate",
+                            "Not interested",
+                            "Job posting age",
+                            "Job no longer open",
                             "Other",
                         ],
                         key=f"ns_reason_{row_key}",
