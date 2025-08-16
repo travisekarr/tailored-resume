@@ -20,14 +20,11 @@ from resume_semantic_scoring_engine import load_resume, generate_tailored_resume
 # Model config helpers
 from models_config import load_models_cfg, ui_choices, ui_default, model_pricing
 
-
-
 # Core job DB helpers
 from job_store import (
     query_top_matches,
     set_job_status,
     set_job_resume,
-    log_api_usage,            # usage logging
 )
 
 # Optional actions (graceful if missing in job_store)
@@ -77,8 +74,15 @@ def format_dt(val):
 _model_cfg = load_models_cfg()
 
 def _model_selectbox(label: str, group: str, *, key: str, disabled: bool = False):
-    choices = ui_choices(_model_cfg, group)
-    default_id = ui_default(_model_cfg, group)
+    # Map legacy group names to openai_pricing.yaml group names
+    group_map = {
+        "chat": "rephrasing",
+        "embeddings": "embeddings",
+        "summary": "summary",
+    }
+    actual_group = group_map.get(group, group)
+    choices = ui_choices(_model_cfg, actual_group)
+    default_id = ui_default(_model_cfg, actual_group)
     ids = [id for _, id in choices]
     labels = {id: display for display, id in choices}
     def _fmt(x): return labels.get(x, x)
@@ -418,7 +422,10 @@ def maybe_paraphrase_experience_bullets(sections, job_description, use_gpt: bool
         out.append(new_sec)
     return out
 
-def generate_tailored_summary_strict(resume, job_description, use_gpt=False, model="gpt-5.0"):
+def generate_tailored_summary_strict(resume, job_description, use_gpt=False, model=None):
+    if model is None:
+        # Use UI/config default for summary model
+        model = st.session_state.get("gen_sum_model") or ui_default(_model_cfg, "chat") or "gpt-4o"
     header = next((sec for sec in resume if sec.get("type") == "header"), {})
     title = header.get("title", "Experienced Professional")
     years_exp = header.get("years_experience")
@@ -512,7 +519,7 @@ with st.sidebar:
     gpt_paraphrase_bullets = st.checkbox("Paraphrase bullets to match JD wording (GPT)", value=True, key="gen_gp_bul")
     gpt_model = _model_selectbox(
         "GPT model for rephrasing",
-        group="chat",
+        group="rephrasing",
         key="gen_gpt_model",
         disabled=not gpt_paraphrase_bullets,
     )
@@ -528,7 +535,7 @@ with st.sidebar:
     )
     gpt_summary_model = _model_selectbox(
         "GPT model for summary",
-        group="chat",
+        group="summary",
         key="gen_sum_model",
         disabled=not (add_tailored_summary and gpt_paraphrase_summary),
     )
@@ -669,6 +676,16 @@ if DISPLAY_JOBS:
         resume_path = c.get("resume_path") or ""
         resume_url = path_to_file_url(resume_path) if resume_path else ""
         resume_score = c.get("resume_score")
+        # Calculate Age (days since posted_at)
+        posted_raw = c.get("posted_at", "")
+        age_days = ""
+        if posted_raw:
+            try:
+                dt_posted = pd.to_datetime(posted_raw, utc=True)
+                now = pd.Timestamp.now(tz=dt_posted.tz)
+                age_days = int((now - dt_posted).days)
+            except Exception:
+                age_days = ""
         return {
             "job_id": c.get("job_id") or c.get("id", ""),
             "score": round(float(c.get("score", 0.0) or 0.0), 3),
@@ -677,7 +694,8 @@ if DISPLAY_JOBS:
             "company": c.get("company", ""),
             "location": c.get("location", ""),
             "source": c.get("source", ""),
-                "posted_at": format_dt(c.get("posted_at", "")),
+            "posted_at": format_dt(posted_raw),
+            "Age": age_days,
             "url": c.get("url", ""),
             "resume": resume_url,
         }
@@ -786,9 +804,9 @@ if DISPLAY_JOBS:
                     "embedding_model": st.session_state.get("gen_embed_model") or "text-embedding-3-small",
                     "add_tailored_summary": st.session_state.get("gen_add_sum", True),
                     "paraphrase_summary_gpt": st.session_state.get("gen_sum_gpt", False),
-                    "summary_gpt_model": st.session_state.get("gen_sum_model") or "gpt-5.0",
+                    "summary_gpt_model": st.session_state.get("gen_sum_model") or "gpt-5",
                     "paraphrase_bullets_gpt": st.session_state.get("gen_gp_bul", False),
-                    "bullets_gpt_model": st.session_state.get("gen_gpt_model") or "gpt-5.0",
+                    "bullets_gpt_model": st.session_state.get("gen_gpt_model") or "gpt-5",
                 }
                 print("[DEBUG] Tailoring options:", debug_options)
                 log(f"[DEBUG] Tailoring options: {debug_options}")
@@ -944,17 +962,29 @@ if DISPLAY_JOBS:
                             st.warning(f"PDF save failed, keeping HTML only:\n\n{e}")
                             log("Save PDF failed:\n" + traceback.format_exc())
 
-                    # Update DB with path + score (tries job_id, then id)
+                    # Determine model used for resume generation
+                    resume_model = "No model"
+                    if 'debug_options' in locals():
+                        # Try to get model from debug_options
+                        if debug_options.get("use_embeddings"):
+                            resume_model = debug_options.get("embedding_model") or "No model"
+                        elif debug_options.get("paraphrase_bullets_gpt"):
+                            resume_model = debug_options.get("bullets_gpt_model") or "No model"
+                        elif debug_options.get("paraphrase_summary_gpt"):
+                            resume_model = debug_options.get("summary_gpt_model") or "No model"
+
+                    # Update DB with path + score + model (tries job_id, then id)
                     try:
                         ok = set_job_resume(
                             db_path=db_path,
                             job_id=(cache.get("job_id") or job_id),
                             resume_path=saved_path,
                             resume_score=float(out_score),
+                            resume_model=resume_model,
                         )
                         if ok:
-                            st.success(f"Saved → {saved_path}\nScore stored: {out_score:.3f}")
-                            log(f"[db-update] job_id={(cache.get('job_id') or job_id)} path={saved_path} score={out_score:.3f}")
+                            st.success(f"Saved → {saved_path}\nScore stored: {out_score:.3f}\nModel: {resume_model}")
+                            log(f"[db-update] job_id={(cache.get('job_id') or job_id)} path={saved_path} score={out_score:.3f} model={resume_model}")
                             try:
                                 set_job_status(db_path, (cache.get("job_id") or job_id), status="saved")
                             except Exception:
@@ -993,20 +1023,49 @@ def _row_sub(c):
         "resume_score": (round(float(rs),3) if rs is not None else ""),
         "url": c.get("url",""),
         "resume": resume_url,
+        "interviewed": bool(int(c.get("interviewed") or 0)),
+        "rejected": bool(int(c.get("rejected") or 0)),
     }
 
 if submitted_rows:
     df_sub = pd.DataFrame([_row_sub(r) for r in submitted_rows])
     df_sub = make_arrow_friendly(df_sub)
-    st.dataframe(
+    # Order by submitted_at desc
+    if "submitted_at" in df_sub.columns:
+        df_sub["_sort_submitted"] = pd.to_datetime(df_sub["submitted_at"], errors="coerce")
+        df_sub = df_sub.sort_values(by="_sort_submitted", ascending=False).drop(columns=["_sort_submitted"])
+
+    # Use data_editor for editable checkboxes in table
+    edited = st.data_editor(
         df_sub,
         use_container_width=True,
         column_config={
             "url": st.column_config.LinkColumn("URL", display_text="Open"),
             "resume": st.column_config.LinkColumn("Resume", display_text="View"),
+            "interviewed": st.column_config.CheckboxColumn("Interviewed"),
+            "rejected": st.column_config.CheckboxColumn("Rejected"),
         },
         height=360,
+        num_rows="dynamic",
+        disabled=[col for col in df_sub.columns if col not in ["interviewed", "rejected"]],
     )
+    # Update DB if checkboxes changed
+    for idx, row in edited.iterrows():
+        job_id = row["job_id"]
+        orig_row = next((r for r in submitted_rows if (r.get("job_id") or r.get("id")) == job_id), None)
+        if orig_row:
+            if row["interviewed"] != bool(int(orig_row.get("interviewed") or 0)):
+                try:
+                    set_job_status(defaults.get("db", "jobs.db"), job_id, interviewed=int(row["interviewed"]), interviewed_at=datetime.now(timezone.utc).isoformat())
+                    st.success(f"Interviewed flag updated for {job_id}")
+                except Exception as e:
+                    st.error(f"Failed to update interviewed: {e}")
+            if row["rejected"] != bool(int(orig_row.get("rejected") or 0)):
+                try:
+                    set_job_status(defaults.get("db", "jobs.db"), job_id, rejected=int(row["rejected"]), rejected_at=datetime.now(timezone.utc).isoformat())
+                    st.success(f"Rejected flag updated for {job_id}")
+                except Exception as e:
+                    st.error(f"Failed to update rejected: {e}")
 else:
     st.info("No submitted jobs yet.")
 

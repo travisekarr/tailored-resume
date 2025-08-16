@@ -11,6 +11,34 @@ from io import BytesIO
 from dotenv import load_dotenv
 from openai import OpenAI
 import streamlit as st
+# Model config helpers
+from models_config import load_models_cfg, ui_choices, ui_default
+_model_cfg = load_models_cfg()
+
+def _model_selectbox(label: str, group: str, *, key: str, disabled: bool = False):
+    group_map = {
+        "chat": "rephrasing",
+        "embeddings": "embeddings",
+        "summary": "summary",
+    }
+    actual_group = group_map.get(group, group)
+    choices = ui_choices(_model_cfg, actual_group)
+    default_id = ui_default(_model_cfg, actual_group)
+    ids = [id for _, id in choices]
+    labels = {id: display for display, id in choices}
+    def _fmt(x): return labels.get(x, x)
+    try:
+        default_idx = ids.index(default_id) if default_id in ids else 0
+    except Exception:
+        default_idx = 0
+    return st.selectbox(
+        label,
+        ids,
+        index=default_idx,
+        key=key,
+        disabled=disabled,
+        format_func=_fmt,
+    )
 from jinja2 import Environment, FileSystemLoader
 
 from resume_semantic_scoring_engine import (
@@ -28,8 +56,25 @@ RESUME_PATH = "modular_resume_full.yaml"
 
 # --- Setup ---
 load_dotenv()
-print("OPENAI_API_KEY:", os.environ.get("OPENAI_API_KEY"))
+#print("OPENAI_API_KEY:", os.environ.get("OPENAI_API_KEY"))
 client = OpenAI()
+
+# ----- Sidebar Model Pickers -----
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("Model Selection")
+    embedding_model_sel = _model_selectbox(
+        "Embeddings model",
+        group="embeddings",
+        key="app_embed_model",
+        disabled=False,
+    )
+    gpt_model_sel = _model_selectbox(
+        "GPT model",
+        group="rephrasing",
+        key="app_gpt_model",
+        disabled=False,
+    )
 
 # ----- Model/pricing directories -----
 GPT_MODELS = {
@@ -227,10 +272,12 @@ def _cosine(a, b):
     db = math.sqrt(sum(y*y for y in b))
     return (num / (da * db)) if da and db else 0.0
 
-def _pick_best_achievement_embeddings(resume, job_description: str, embedding_model: str) -> str | None:
+def _pick_best_achievement_embeddings(resume, job_description: str, embedding_model: str = None) -> str | None:
     candidates = _collect_candidate_achievements(resume)
     if not candidates:
         return None
+    if embedding_model is None:
+        embedding_model = st.session_state.get("app_embed_model") or ui_default(_model_cfg, "embeddings") or "text-embedding-3-small"
     resp = client.embeddings.create(model=embedding_model, input=[job_description] + candidates)
     jd_vec = resp.data[0].embedding
     best_idx, best_score = -1, -1.0
@@ -249,7 +296,9 @@ def _build_summary_outline(title, years_exp, skills_str, achievement):
         parts.append("Notable achievement: [ACHIEVEMENT]")
     return ". ".join(parts) + "."
 
-def _safe_paraphrase_with_placeholders(outline, model):
+def _safe_paraphrase_with_placeholders(outline, model=None):
+    if model is None:
+        model = st.session_state.get("app_gpt_model") or ui_default(_model_cfg, "rephrasing") or "gpt-4o"
     prompt = f"""
 Rewrite the following into a polished 2–4 sentence professional summary (<=300 characters),
 keeping the placeholders [TITLE], [YEARS], [SKILLS], and [ACHIEVEMENT] EXACTLY AS WRITTEN.

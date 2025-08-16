@@ -1,3 +1,31 @@
+# Model config helpers
+from models_config import load_models_cfg, ui_choices, ui_default
+_model_cfg = load_models_cfg()
+
+def _model_selectbox(label: str, group: str, *, key: str, disabled: bool = False):
+    group_map = {
+        "chat": "rephrasing",
+        "embeddings": "embeddings",
+        "summary": "summary",
+    }
+    actual_group = group_map.get(group, group)
+    choices = ui_choices(_model_cfg, actual_group)
+    default_id = ui_default(_model_cfg, actual_group)
+    ids = [id for _, id in choices]
+    labels = {id: display for display, id in choices}
+    def _fmt(x): return labels.get(x, x)
+    try:
+        default_idx = ids.index(default_id) if default_id in ids else 0
+    except Exception:
+        default_idx = 0
+    return st.selectbox(
+        label,
+        ids,
+        index=default_idx,
+        key=key,
+        disabled=disabled,
+        format_func=_fmt,
+    )
 # pages/02_Job_Reports.py
 import os
 import csv
@@ -408,6 +436,14 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    st.subheader("Model Selection")
+    # Example: add a model picker for embeddings (can add more for other features)
+    embedding_model_sel = _model_selectbox(
+        "Embeddings model",
+        group="embeddings",
+        key="jr_embed_model",
+        disabled=False,
+    )
     st.subheader("Danger zone")
 
     st.caption("Type **WIPE** to clear rows (keep schema) or **NUKE** to delete & recreate the DB file.")

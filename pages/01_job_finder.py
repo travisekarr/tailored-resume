@@ -29,14 +29,35 @@ from datetime import datetime
 from job_hunter import hunt_jobs, probe_sources, load_sources_yaml
 from job_store import store_jobs
 
-# Optional OpenAI client (safe if unavailable)
-try:
-    from openai import OpenAI
-    _openai_client = OpenAI()
-except Exception:
-    _openai_client = None
 
-os.environ["USAGE_CONTEXT"] = "ui:job_finder"
+# Model config helpers
+from models_config import load_models_cfg, ui_choices, ui_default
+_model_cfg = load_models_cfg()
+
+def _model_selectbox(label: str, group: str, *, key: str, disabled: bool = False):
+    group_map = {
+        "chat": "rephrasing",
+        "embeddings": "embeddings",
+        "summary": "summary",
+    }
+    actual_group = group_map.get(group, group)
+    choices = ui_choices(_model_cfg, actual_group)
+    default_id = ui_default(_model_cfg, actual_group)
+    ids = [id for _, id in choices]
+    labels = {id: display for display, id in choices}
+    def _fmt(x): return labels.get(x, x)
+    try:
+        default_idx = ids.index(default_id) if default_id in ids else 0
+    except Exception:
+        default_idx = 0
+    return st.selectbox(
+        label,
+        ids,
+        index=default_idx,
+        key=key,
+        disabled=disabled,
+        format_func=_fmt,
+    )
 
 st.set_page_config(page_title="Job Finder (Aggregators)", layout="wide")
 st.title("🔎 Job Finder — Aggregator Search")
@@ -205,15 +226,11 @@ with st.sidebar:
 
     st.markdown("---")
     use_embeddings = st.checkbox("Use OpenAI embeddings", value=False)
-    emb_options = _embedding_model_options()
-    # pick a stable default (3-small) if available; else first option
-    default_index = emb_options.index("text-embedding-3-small") if "text-embedding-3-small" in emb_options else 0
-    embedding_model_sel = st.selectbox(
+    embedding_model_sel = _model_selectbox(
         "Embeddings model",
-        emb_options,
-        index=default_index,
+        group="embeddings",
+        key="jf_embed_model",
         disabled=not use_embeddings,
-        key="jf_embed_model"
     )
 
     st.markdown("---")

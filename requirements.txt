@@ -1,10 +1,10 @@
 # Core resume builder dependencies
-streamlit>=1.37.0
+streamlit>=1.25.0
 jinja2>=3.1.2
 PyYAML>=6.0.1
 scikit-learn>=1.3.0
 python-dotenv>=1.0.0
-openai>=1.2.0
+openai>=1.99.9
 
 # PDF generation
 weasyprint>=59.0

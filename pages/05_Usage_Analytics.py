@@ -1,3 +1,31 @@
+# Model config helpers
+from models_config import load_models_cfg, ui_choices, ui_default
+_model_cfg = load_models_cfg()
+
+def _model_selectbox(label: str, group: str, *, key: str, disabled: bool = False):
+    group_map = {
+        "chat": "rephrasing",
+        "embeddings": "embeddings",
+        "summary": "summary",
+    }
+    actual_group = group_map.get(group, group)
+    choices = ui_choices(_model_cfg, actual_group)
+    default_id = ui_default(_model_cfg, actual_group)
+    ids = [id for _, id in choices]
+    labels = {id: display for display, id in choices}
+    def _fmt(x): return labels.get(x, x)
+    try:
+        default_idx = ids.index(default_id) if default_id in ids else 0
+    except Exception:
+        default_idx = 0
+    return st.selectbox(
+        label,
+        ids,
+        index=default_idx,
+        key=key,
+        disabled=disabled,
+        format_func=_fmt,
+    )
 import dateutil.parser
 def format_dt(val):
     if not val:
@@ -56,6 +84,13 @@ with st.sidebar:
     db_path = st.text_input("Database file", value="jobs.db")
     days = st.slider("Lookback (days)", 1, 90, 30)
     group = st.selectbox("Group by", ["day", "week", "month"], index=0)
+    st.subheader("Model Selection")
+    embedding_model_sel = _model_selectbox(
+        "Embeddings model",
+        group="embeddings",
+        key="ua_embed_model",
+        disabled=False,
+    )
     model_filter = st.text_input("Model contains", value="")
     endpoint_filter = st.selectbox("Endpoint", ["(any)", "chat.completions", "responses", "embeddings"], index=0)
     context_filter = st.text_input("Context equals (optional)", value="")  # e.g. ui:04_Generate_From_Jobs
@@ -82,6 +117,13 @@ if not usage:
 
 df = pd.DataFrame(usage)
 df["called_at"] = df["called_at"].apply(format_dt)
+# Ensure 'date', 'week', 'month' columns exist for grouping
+if "called_at" in df.columns:
+    # Parse called_at to datetime
+    dt_col = pd.to_datetime(df["called_at"], errors="coerce")
+    df["date"] = dt_col.dt.date.astype(str)
+    df["week"] = dt_col.dt.strftime("%Y-W%U")
+    df["month"] = dt_col.dt.strftime("%Y-%m")
 
 # Top summary
 total_calls = len(df)

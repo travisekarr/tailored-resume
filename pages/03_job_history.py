@@ -1,3 +1,31 @@
+# Model config helpers
+from models_config import load_models_cfg, ui_choices, ui_default
+_model_cfg = load_models_cfg()
+
+def _model_selectbox(label: str, group: str, *, key: str, disabled: bool = False):
+    group_map = {
+        "chat": "rephrasing",
+        "embeddings": "embeddings",
+        "summary": "summary",
+    }
+    actual_group = group_map.get(group, group)
+    choices = ui_choices(_model_cfg, actual_group)
+    default_id = ui_default(_model_cfg, actual_group)
+    ids = [id for _, id in choices]
+    labels = {id: display for display, id in choices}
+    def _fmt(x): return labels.get(x, x)
+    try:
+        default_idx = ids.index(default_id) if default_id in ids else 0
+    except Exception:
+        default_idx = 0
+    return st.selectbox(
+        label,
+        ids,
+        index=default_idx,
+        key=key,
+        disabled=disabled,
+        format_func=_fmt,
+    )
 # pages/03_job_history.py
 import csv
 from io import StringIO
@@ -69,17 +97,18 @@ with st.sidebar:
         default=["remotive", "remoteok", "weworkremotely", "hnrss"]
     )
     min_score = st.slider("Min score", 0.0, 1.0, 0.0, 0.01)
-    days = st.selectbox("Posted within (days)", [0, 1, 3, 7, 14, 30, 60, 90], index=4)
+    days = st.selectbox("Posted within (days)", [0, 1, 3, 7, 14, 30, 60, 90, 180], index=7)
     query = st.text_input("Keyword (title/company/desc/url)")
 
-    # New: flag filters
-    st.markdown("---")
-    st.subheader("Flags")
-    only_submitted = st.checkbox("Show submitted only", value=False)
-    only_not_suitable = st.checkbox("Show not suitable only", value=False)
-    hide_flagged = st.checkbox("Hide submitted & not suitable", value=False)
 
     st.markdown("---")
+    st.subheader("Model Selection")
+    embedding_model_sel = _model_selectbox(
+        "Embeddings model",
+        group="embeddings",
+        key="jh_embed_model",
+        disabled=False,
+    )
     order = st.selectbox("Sort by", ["score_desc", "date_desc", "updated_desc"], index=0)
     limit = st.slider("Max rows", 50, 2000, 500, 50)
 
@@ -115,30 +144,20 @@ if not rows:
 norm = []
 for r in rows:
     d = dict(r)
-    # Add unified job_id for display/export if only 'id' exists
     d["job_id"] = d.get("job_id") or d.get("id")
-
-    # Flags may be missing in older rows — coerce safely
     d["submitted"] = _boolish(d.get("submitted"))
     d["not_suitable"] = _boolish(d.get("not_suitable"))
-
-    # Standardize date/time fields
-    for k in ["posted_at", "first_seen", "last_seen", "pulled_at", "created_at", "updated_at", "submitted_at", "not_suitable_at"]:
+    d["interviewed"] = _boolish(d.get("interviewed"))
+    d["rejected"] = _boolish(d.get("rejected"))
+    for k in [
+        "posted_at", "first_seen", "last_seen", "pulled_at", "created_at", "updated_at",
+        "submitted_at", "not_suitable_at", "interviewed_at", "rejected_at"
+    ]:
         if k in d:
             d[k] = format_dt(d.get(k))
-
     norm.append(d)
 
 # Apply flag filters (mutually-aware, but simple rules)
-if hide_flagged:
-    norm = [r for r in norm if not r["submitted"] and not r["not_suitable"]]
-elif only_submitted and only_not_suitable:
-    norm = [r for r in norm if r["submitted"] or r["not_suitable"]]
-elif only_submitted:
-    norm = [r for r in norm if r["submitted"]]
-elif only_not_suitable:
-    norm = [r for r in norm if r["not_suitable"]]
-# If none of the toggles are on, show all jobs (unless hide_flagged is checked above)
 
 # ---------- Counts ----------
 total = len(norm)
@@ -155,48 +174,71 @@ k4.metric("Neither", neutral_ct)
 st.write(f"Showing {total} row(s).")
 
 # ---------- Table ----------
-df = pd.DataFrame(norm)
 
-# Choose a concise but useful default column set
-preferred_cols = [
-    "score", "title", "company", "location", "source",
-    "posted_at", "submitted", "not_suitable", "url"
+# ---------- Tabs ----------
+tab_labels = [
+    "All", "Resume", "Submitted", "Un suitable", "Interviewed", "Rejected"
 ]
-show_cols = [c for c in preferred_cols if c in df.columns]
-# Always add job_id at front if present
-if "job_id" in df.columns and "job_id" not in show_cols:
-    show_cols = ["job_id"] + show_cols
+tab_keys = [
+    "all", "resume", "submitted", "not_suitable", "interviewed", "rejected"
+]
+tabs = st.tabs(tab_labels)
 
-df = _arrow(df)
+tab_filters = {
+    "all": lambda r: True,
+    "resume": lambda r: bool(r.get("resume_path")),
+    "submitted": lambda r: r.get("submitted", False),
+    "not_suitable": lambda r: r.get("not_suitable", False),
+    "interviewed": lambda r: r.get("interviewed", False),
+    "rejected": lambda r: r.get("rejected", False),
+}
 
-st.dataframe(
-    df[show_cols],
-    use_container_width=True,
-    height=520,
-    column_config={
-        "url": st.column_config.LinkColumn("URL", display_text="Open"),
-        "submitted": st.column_config.CheckboxColumn("Submitted"),
-        "not_suitable": st.column_config.CheckboxColumn("Not suitable"),
-    },
-)
-
-# Optional: expanded view with more columns
-with st.expander("Show advanced columns (timestamps, resume path/score)"):
-    adv_cols = [
-        "job_id", "status", "user_notes", "first_seen", "last_seen", "updated_at",
-        "submitted", "submitted_at", "not_suitable", "not_suitable_at",
-        "not_suitable_reasons", "unsuitable_reason_note",
-        "resume_path", "resume_score"
-    ]
-    adv_cols = [c for c in adv_cols if c in df.columns]
-    if adv_cols:
-        st.dataframe(df[adv_cols], use_container_width=True, height=300)
-    else:
-        st.caption("No advanced columns available in this dataset.")
+for i, tab in enumerate(tabs):
+    with tab:
+        filtered = [r for r in norm if tab_filters[tab_keys[i]](r)]
+        df = pd.DataFrame(filtered)
+        preferred_cols = [
+            "score", "title", "company", "location", "source",
+            "posted_at", "submitted", "not_suitable", "interviewed", "rejected", "url"
+        ]
+        show_cols = [c for c in preferred_cols if c in df.columns]
+        if "job_id" in df.columns and "job_id" not in show_cols:
+            show_cols = ["job_id"] + show_cols
+        df = _arrow(df)
+        st.dataframe(
+            df[show_cols],
+            use_container_width=True,
+            height=520,
+            column_config={
+                "url": st.column_config.LinkColumn("URL", display_text="Open"),
+                "submitted": st.column_config.CheckboxColumn("Submitted"),
+                "not_suitable": st.column_config.CheckboxColumn("Not suitable"),
+                "interviewed": st.column_config.CheckboxColumn("Interviewed"),
+                "rejected": st.column_config.CheckboxColumn("Rejected"),
+            },
+        )
+        with st.expander("Show advanced columns (timestamps, resume path/score)"):
+            adv_cols = [
+                "job_id", "status", "user_notes", "first_seen", "last_seen", "updated_at",
+                "submitted", "submitted_at", "not_suitable", "not_suitable_at",
+                "interviewed", "interviewed_at", "rejected", "rejected_at",
+                "not_suitable_reasons", "unsuitable_reason_note",
+                "resume_path", "resume_score"
+            ]
+            adv_cols = [c for c in adv_cols if c in df.columns]
+            if adv_cols:
+                st.dataframe(df[adv_cols], use_container_width=True, height=300)
+            else:
+                st.caption("No advanced columns available in this dataset.")
 
 # ---------- Export CSV ----------
+
+# Collect all possible keys from all rows for CSV export
+all_keys = set()
+for r in norm:
+    all_keys.update(r.keys())
 csv_buf = StringIO()
-writer = csv.DictWriter(csv_buf, fieldnames=list(df.columns))
+writer = csv.DictWriter(csv_buf, fieldnames=sorted(all_keys))
 writer.writeheader()
 for r in norm:
     writer.writerow(r)

@@ -68,6 +68,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   description TEXT,
   score REAL,
   hash_key TEXT,
+    interviewed INTEGER DEFAULT 0,
+    interviewed_at TEXT,
+    rejected INTEGER DEFAULT 0,
+    rejected_at TEXT,
   created_at TEXT,
   updated_at TEXT
 );
@@ -110,7 +114,12 @@ MIGRATION_COLS = [
     ("unsuitable_reason_note",     "ALTER TABLE jobs ADD COLUMN unsuitable_reason_note TEXT"),
     ("submitted",                  "ALTER TABLE jobs ADD COLUMN submitted INTEGER DEFAULT 0"),
     ("submitted_at",               "ALTER TABLE jobs ADD COLUMN submitted_at TEXT"),
-    ("job_id",                     "ALTER TABLE jobs ADD COLUMN job_id TEXT")
+    ("job_id",                     "ALTER TABLE jobs ADD COLUMN job_id TEXT"),
+    ("interviewed",                "ALTER TABLE jobs ADD COLUMN interviewed INTEGER DEFAULT 0"),
+    ("interviewed_at",             "ALTER TABLE jobs ADD COLUMN interviewed_at TEXT"),
+    ("rejected",                   "ALTER TABLE jobs ADD COLUMN rejected INTEGER DEFAULT 0"),
+    ("rejected_at",                "ALTER TABLE jobs ADD COLUMN rejected_at TEXT"),
+    ("resume_model",               "ALTER TABLE jobs ADD COLUMN resume_model TEXT"),
 ]
 
 def connect(db_path: Optional[str] = None) -> sqlite3.Connection:
@@ -362,6 +371,7 @@ def log_api_usage(
 REPORT_COLS = [
     "id","title","company","location","remote","url","source",
     "posted_at","pulled_at","description","score","hash_key",
+    "interviewed","interviewed_at","rejected","rejected_at",
     "created_at","updated_at","status","status_notes","starred",
     "first_seen","last_seen","resume_path","resume_score",
     "not_suitable","not_suitable_at","not_suitable_reasons","unsuitable_reason_note",
@@ -380,6 +390,12 @@ def _row_to_dict(row) -> dict:
         except Exception: pass
     if d.get("score") is not None:
         try: d["score"] = float(d["score"])
+        except Exception: pass
+    if d.get("interviewed") is not None:
+        try: d["interviewed"] = int(d["interviewed"])
+        except Exception: pass
+    if d.get("rejected") is not None:
+        try: d["rejected"] = int(d["rejected"])
         except Exception: pass
     return d
 
@@ -659,6 +675,7 @@ def set_job_resume(
     job_key: str | None = None,
     resume_path: str | None = None,
     resume_score: float | None = None,
+    resume_model: str | None = None,
 ) -> bool:
     """
     Persist resume_path/score; robust match by id OR job_id OR url OR hash_key.
@@ -675,9 +692,16 @@ def set_job_resume(
                 conn.execute("ALTER TABLE jobs ADD COLUMN resume_path TEXT")
             if "resume_score" not in cols:
                 conn.execute("ALTER TABLE jobs ADD COLUMN resume_score REAL")
+            if "resume_model" not in cols:
+                conn.execute("ALTER TABLE jobs ADD COLUMN resume_model TEXT")
             now = utcnow()
-            sets = "resume_path = ?, resume_score = ?, updated_at = ?"
-            params = (resume_path, resume_score, now)
+            sets = "resume_path = ?, resume_score = ?, resume_model = ?, updated_at = ?"
+            params = (
+                resume_path,
+                resume_score,
+                resume_model if resume_model is not None else "No model",
+                now,
+            )
             where_sql, wparams = _where_by_any_key(conn, str(key))
             cur = conn.execute(f"UPDATE jobs SET {sets} WHERE {where_sql}", (*params, *wparams))
             conn.commit()
