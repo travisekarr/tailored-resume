@@ -107,6 +107,7 @@ MIGRATION_COLS = [
     ("last_seen",                  "ALTER TABLE jobs ADD COLUMN last_seen TEXT"),
     ("resume_path",                "ALTER TABLE jobs ADD COLUMN resume_path TEXT"),
     ("resume_score",               "ALTER TABLE jobs ADD COLUMN resume_score REAL"),
+    ("resume_template",            "ALTER TABLE jobs ADD COLUMN resume_template TEXT"),
     ("not_suitable",               "ALTER TABLE jobs ADD COLUMN not_suitable INTEGER DEFAULT 0"),
     ("not_suitable_at",            "ALTER TABLE jobs ADD COLUMN not_suitable_at TEXT"),
     ("not_suitable_reasons",       "ALTER TABLE jobs ADD COLUMN not_suitable_reasons TEXT"),
@@ -676,6 +677,7 @@ def set_job_resume(
     resume_path: str | None = None,
     resume_score: float | None = None,
     resume_model: str | None = None,
+    resume_template: str | None = None,
 ) -> bool:
     """
     Persist resume_path/score; robust match by id OR job_id OR url OR hash_key.
@@ -694,12 +696,15 @@ def set_job_resume(
                 conn.execute("ALTER TABLE jobs ADD COLUMN resume_score REAL")
             if "resume_model" not in cols:
                 conn.execute("ALTER TABLE jobs ADD COLUMN resume_model TEXT")
+            if "resume_template" not in cols:
+                conn.execute("ALTER TABLE jobs ADD COLUMN resume_template TEXT")
             now = utcnow()
-            sets = "resume_path = ?, resume_score = ?, resume_model = ?, updated_at = ?"
+            sets = "resume_path = ?, resume_score = ?, resume_model = ?, resume_template = ?, updated_at = ?"
             params = (
                 resume_path,
                 resume_score,
                 resume_model if resume_model is not None else "No model",
+                resume_template if resume_template is not None else "unknown",
                 now,
             )
             where_sql, wparams = _where_by_any_key(conn, str(key))

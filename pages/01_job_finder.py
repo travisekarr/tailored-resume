@@ -1,3 +1,4 @@
+_openai_client = None
 import dateutil.parser
 def format_dt(val):
     if not val:
@@ -272,6 +273,8 @@ if test_sources:
         st.warning("No aggregators configured or YAML invalid (open the YAML Inspector and check).")
 
 # ---------- Run fetch ----------
+
+emb_options = _embedding_model_options()
 if run:
     eff_embed_model = _effective_embedding_model(embedding_model_sel, emb_options)
 

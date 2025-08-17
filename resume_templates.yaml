@@ -1,0 +1,11 @@
+# Resume template configuration
+# Add new templates here to make them available in the UI
+resume_templates:
+  - id: modern
+    display: Modern (Sidebar)
+    path: templates/tailored_resume_modern_template.html
+    default: true
+  - id: classic
+    display: Classic (Single Column)
+    path: templates/tailored_resume_template.html
+    default: false

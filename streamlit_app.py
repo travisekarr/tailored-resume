@@ -11,6 +11,7 @@ from io import BytesIO
 from dotenv import load_dotenv
 from openai import OpenAI
 import streamlit as st
+from resume_template_config import load_resume_templates, get_default_template_id, get_template_path_by_id
 # Model config helpers
 from models_config import load_models_cfg, ui_choices, ui_default
 _model_cfg = load_models_cfg()
@@ -53,6 +54,9 @@ from resume_semantic_scoring_engine import (
 # CONFIG
 # ==============================
 RESUME_PATH = "modular_resume_full.yaml"
+# Load template config
+_resume_templates = load_resume_templates()
+_default_template_id = get_default_template_id(_resume_templates)
 
 # --- Setup ---
 load_dotenv()
@@ -510,6 +514,24 @@ job_description = st.text_area("📝 Job Description", height=240, key="ta_job_d
 
 col1, col2 = st.columns(2)
 with col1:
+    # Resume template selector
+    template_ids = [t["id"] for t in _resume_templates]
+    template_labels = {t["id"]: t["display"] for t in _resume_templates}
+    def _fmt_template(x): return template_labels.get(x, x)
+    selected_template_id = st.selectbox(
+        "Resume template",
+        template_ids,
+        index=template_ids.index(_default_template_id) if _default_template_id in template_ids else 0,
+        key="app_template_id",
+        format_func=_fmt_template,
+    )
+    ordering_mode = st.radio("Experience Ordering", ("Relevancy First", "Chronological", "Hybrid"), index=0, key="rad_ordering")
+    top_n_hybrid = 3
+    if ordering_mode == "Hybrid":
+        top_n_hybrid = st.slider("Top relevant items before chronological:", 1, 10, 3, key="sld_top_n_hybrid")
+    highlight = st.checkbox("Highlight matches in preview", value=True, key="chk_highlight")
+
+with col2:
     summary_mode = st.radio("Summary Mode", ("Offline (free)", "GPT-powered (API cost)"), index=0, key="rad_summary_mode")
     strict_mode = summary_mode == "GPT-powered (API cost)" and st.checkbox(
         "Strict factual mode (no new claims)", value=True,
@@ -528,12 +550,6 @@ with col1:
     if add_impact:
         bullets_per_role = st.slider("Impact bullets per role", 1, 3, 1, key="sld_bullets_per_role")
     show_generated = st.checkbox("Show generated impact statements", value=True, key="chk_show_generated")
-
-with col2:
-    ordering_mode = st.radio("Experience Ordering", ("Relevancy First", "Chronological", "Hybrid"), index=0, key="rad_ordering")
-    top_n_hybrid = 3
-    if ordering_mode == "Hybrid":
-        top_n_hybrid = st.slider("Top relevant items before chronological:", 1, 10, 3, key="sld_top_n_hybrid")
     # Embeddings options
     use_embeddings = st.checkbox("Use semantic matching (OpenAI embeddings)", value=False, key="chk_use_embeddings")
     embedding_model = st.selectbox(
@@ -544,32 +560,39 @@ with col2:
         disabled=not use_embeddings,
         key="sel_embed_model"
     )
-    highlight = st.checkbox("Highlight matches in preview", value=True, key="chk_highlight")
 
 # Generate
 if st.button("Generate Tailored Resume", use_container_width=True, key="btn_generate_resume"):
+
     if not job_description.strip():
         st.warning("Please enter a job description first.")
     else:
-        tailored, scores_map = generate_tailored_resume(
-            resume,
-            job_description,
-            top_n=top_n_hybrid,
-            use_embeddings=use_embeddings,
-            ordering=ordering_mode.lower(),   # 'relevancy'/'chronological'/'hybrid'
-            embedding_model=embedding_model if use_embeddings else "text-embedding-3-small",
-        )
+        try:
+            tailored, scores_map = generate_tailored_resume(
+                resume,
+                job_description,
+                top_n=top_n_hybrid,
+                use_embeddings=use_embeddings,
+                ordering=ordering_mode.lower(),   # 'relevancy'/'chronological'/'hybrid'
+                embedding_model=embedding_model if use_embeddings else "text-embedding-3-small",
+            )
+        except Exception as e:
+            st.error(f"Error generating tailored resume: {e}")
+            tailored, scores_map = [], {}
 
         # Add tailored impact bullets if requested (requires GPT mode)
         if add_impact and (summary_mode == "GPT-powered (API cost)"):
-            tailored = enhance_experience_with_impact(
-                tailored,
-                job_description,
-                use_gpt=True,
-                model=selected_model,
-                mark_generated=True,
-                bullets_per_role=bullets_per_role,
-            )
+            try:
+                tailored = enhance_experience_with_impact(
+                    tailored,
+                    job_description,
+                    use_gpt=True,
+                    model=selected_model,
+                    mark_generated=True,
+                    bullets_per_role=bullets_per_role,
+                )
+            except Exception as e:
+                st.error(f"Error adding impact statements: {e}")
 
         # Hide generated impact if the user unchecks it
         if not show_generated:
@@ -580,30 +603,51 @@ if st.button("Generate Tailored Resume", use_container_width=True, key="btn_gene
                         if not (c.get("impact") and c.get("source") == "generated")
                     ]
 
-        tailored_summary = generate_tailored_summary(
-            resume,
-            job_description,
-            use_gpt=(summary_mode == "GPT-powered (API cost)"),
-            model=selected_model,
-            use_embeddings=use_embeddings,
-            embedding_model=(embedding_model if use_embeddings else "text-embedding-3-small"),
-        )
+        try:
+            tailored_summary = generate_tailored_summary(
+                resume,
+                job_description,
+                use_gpt=(summary_mode == "GPT-powered (API cost)"),
+                model=selected_model,
+                use_embeddings=use_embeddings,
+                embedding_model=(embedding_model if use_embeddings else "text-embedding-3-small"),
+            )
+        except Exception as e:
+            st.error(f"Error generating tailored summary: {e}")
+            tailored_summary = ""
 
-        env = Environment(loader=FileSystemLoader("."))
-        template = env.get_template("tailored_resume_template.html")
-        html = template.render(header=header, tailored_summary=tailored_summary, resume=tailored)
+        try:
+            template_path = get_template_path_by_id(_resume_templates, selected_template_id)
+            env = Environment(loader=FileSystemLoader("templates"))
+            template = env.get_template(os.path.basename(template_path))
+            html = template.render(header=header, tailored_summary=tailored_summary, resume=tailored)
+            if not html.strip():
+                st.warning("Resume preview is empty. Please check your template and resume data.")
+        except Exception as e:
+            st.error(f"Error rendering resume template: {e}")
+            html = ""
 
         # Highlighted preview
-        highlighted_html = highlight_html(html, job_description) if highlight else html
+        try:
+            highlighted_html = highlight_html(html, job_description) if highlight else html
+        except Exception as e:
+            st.error(f"Error highlighting resume preview: {e}")
+            highlighted_html = html
 
         # Keyword chips (JD ∩ resume)
-        jd_words = set(build_keywords(job_description))
-        resume_text = " ".join((section_text(s) or "").lower() for s in resume)
-        matched = sorted([w for w in jd_words if w in resume_text], key=len, reverse=True)[:50]
+        try:
+            jd_words = set(build_keywords(job_description))
+            resume_text = " ".join((section_text(s) or "").lower() for s in resume)
+            matched = sorted([w for w in jd_words if w in resume_text], key=len, reverse=True)[:50]
+        except Exception as e:
+            matched = []
 
         # Company slug derived from JD (for filenames)
-        company_slug = extract_company_name(job_description)
-        base_name = f"{company_slug}_full_resume" if company_slug else "full_resume"
+        try:
+            company_slug = extract_company_name(job_description)
+            base_name = f"{company_slug}_full_resume" if company_slug else "full_resume"
+        except Exception as e:
+            base_name = "full_resume"
 
         st.session_state.generated_html = html
         st.session_state.highlighted_html = highlighted_html
@@ -615,8 +659,7 @@ if st.button("Generate Tailored Resume", use_container_width=True, key="btn_gene
         st.session_state.header = header
         st.session_state.job_description = job_description
 
-
-# Preview & Download + Scores & Keywords
+# Only show preview/download if resume has been generated
 if "generated_html" in st.session_state:
     html = st.session_state.generated_html
     highlighted_html = st.session_state.get("highlighted_html", html)
@@ -698,7 +741,7 @@ if "generated_html" in st.session_state:
             import base64
             from io import BytesIO
 
-            #  Preview AND download should be generated from the CLEAN HTML (no highlights)
+            # Preview AND download should be generated from the CLEAN HTML (no highlights)
             preview_buf = BytesIO()
             WPHTML(string=html).write_pdf(preview_buf)   # use clean HTML, not highlighted_html
             preview_pdf = preview_buf.getvalue()
@@ -710,7 +753,7 @@ if "generated_html" in st.session_state:
             )
 
             st.download_button(
-                " Download Resume as PDF",
+                "📥 Download Resume as PDF",
                 data=preview_pdf,                     # same clean PDF as preview
                 file_name=f"{base_name}.pdf",
                 mime="application/pdf",

@@ -83,6 +83,7 @@
   contributions:
     - description: Accomplished X by implementing Y, resulting in Z (quantifiable metric).
       skills_used: [Skill1, Skill2]
+      relevancy: both
 
 - id: exp02
   type: experience
@@ -96,6 +97,7 @@
   contributions:
     - description: Example contribution.
       skills_used: [Skill1, Skill2]
+      relevancy: both
 
 # ===== EDUCATION =====
 - id: education

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import pytz
 from dotenv import load_dotenv
 import streamlit as st
+from resume_template_config import load_resume_templates, get_default_template_id, get_template_path_by_id
 import yaml
 import pandas as pd
 from dotenv import load_dotenv
@@ -45,7 +46,9 @@ except Exception:
 # CONFIG
 # ==============================
 RESUME_PATH = "modular_resume_full.yaml"
-TEMPLATE_FILE = "tailored_resume_template.html"
+# Load template config
+_resume_templates = load_resume_templates()
+_default_template_id = get_default_template_id(_resume_templates)
 DEFAULTS_PATH = "report_defaults.yaml"
 MODEL_SETTINGS_PATH = "api_models.yaml"   # <- unified model settings YAML
 
@@ -367,8 +370,15 @@ def build_allowed_vocab(resume, job_description: str) -> list[str]:
     jd_tokens = {w.lower() for w in re.findall(r"[A-Za-z0-9+\-/#\.]{3,}", job_description or "")}
     resume_terms = set()
     for sec in resume:
-        for t in (sec.get("tags") or []):
-            resume_terms.add(t.lower())
+        tags = sec.get("tags")
+        if isinstance(tags, dict):
+            for t in tags.get("hard", []):
+                resume_terms.add(t.lower())
+            for t in tags.get("soft", []):
+                resume_terms.add(t.lower())
+        elif isinstance(tags, list):
+            for t in tags:
+                resume_terms.add(t.lower())
         if sec.get("type") == "experience":
             for c in sec.get("contributions") or []:
                 for s in (c.get("skills_used") or []):
@@ -431,19 +441,46 @@ def generate_tailored_summary_strict(resume, job_description, use_gpt=False, mod
     years_exp = header.get("years_experience")
 
     job_keywords = set(word.lower() for word in job_description.split() if len(word) > 2)
-    all_resume_tags = set()
+    all_hard_tags = set()
+    all_soft_tags = set()
     for section in resume:
-        for t in (section.get("tags") or []):
-            all_resume_tags.add(t.lower())
-    matched_skills = sorted(list(job_keywords & all_resume_tags))
-    top_skills_str = ", ".join(matched_skills[:4]) if matched_skills else None
+        tags = section.get("tags")
+        if isinstance(tags, dict):
+            all_hard_tags.update(t.lower() for t in tags.get("hard", []))
+            all_soft_tags.update(t.lower() for t in tags.get("soft", []))
+        elif isinstance(tags, list):
+            all_hard_tags.update(t.lower() for t in tags)
+    matched_hard = sorted(list(job_keywords & all_hard_tags))
+    matched_soft = sorted(list(job_keywords & all_soft_tags))
+    top_hard_str = ", ".join(matched_hard[:4]) if matched_hard else None
+    top_soft_str = ", ".join(matched_soft[:4]) if matched_soft else None
 
     achievement = _pick_best_achievement_overlap(resume, job_description)
 
+    # Heuristic: managerial/lead/manager keywords
+    manager_keywords = {"manager", "lead", "leadership", "director", "head", "supervisor"}
+    developer_keywords = {"developer", "engineer", "programmer", "software", "devops", "architect", "coder"}
+    job_title_lower = (header.get("title", "") or "").lower() + " " + job_description.lower()
+    is_managerial = any(k in job_title_lower for k in manager_keywords)
+    is_developer = any(k in job_title_lower for k in developer_keywords)
+
     opening = f"{title} with {years_exp}+ years of proven expertise" if years_exp else f"{title} with proven expertise"
     offline = opening
-    if top_skills_str:
-        offline += f". Specializing in {top_skills_str}"
+    if is_managerial:
+        if top_soft_str:
+            offline += f". Managerial strengths: {top_soft_str}"
+        if top_hard_str:
+            offline += f". Technical strengths: {top_hard_str}"
+    elif is_developer:
+        if top_hard_str:
+            offline += f". Developer strengths: {top_hard_str}"
+        if top_soft_str:
+            offline += f". Collaboration strengths: {top_soft_str}"
+    else:
+        if top_hard_str:
+            offline += f". Key skills: {top_hard_str}"
+        if top_soft_str:
+            offline += f". Soft skills: {top_soft_str}"
     if achievement:
         offline += f". Notable achievement: {achievement}"
     offline += "."
@@ -451,10 +488,10 @@ def generate_tailored_summary_strict(resume, job_description, use_gpt=False, mod
     if not use_gpt:
         return offline
 
-    outline = _build_summary_outline(title, years_exp, top_skills_str, achievement)
+    outline = _build_summary_outline(title, years_exp, top_hard_str or top_soft_str, achievement)
     try:
-        templated = _safe_paraphrase_with_placeholders(outline, model)
-        final = _substitute_placeholders(templated, title, years_exp, top_skills_str, achievement)
+        templated = _safe_paraphrase_with_placeholders(outline, title, years_exp, top_hard_str or top_soft_str, achievement)
+        final = _substitute_placeholders(templated, title, years_exp, top_hard_str or top_soft_str, achievement)
         return final
     except Exception:
         return offline
@@ -476,6 +513,18 @@ fdefs = defaults.get("filters", {})
 
 # Configurable save dir (defaults + ensure exists)
 with st.sidebar:
+    st.markdown("---")
+    st.subheader("Resume Template")
+    template_ids = [t["id"] for t in _resume_templates]
+    template_labels = {t["id"]: t["display"] for t in _resume_templates}
+    def _fmt_template(x): return template_labels.get(x, x)
+    selected_template_id = st.selectbox(
+        "Resume template",
+        template_ids,
+        index=template_ids.index(_default_template_id) if _default_template_id in template_ids else 0,
+        key="gen_template_id",
+        format_func=_fmt_template,
+    )
     debug_usage_log = st.checkbox("Debug: print OpenAI usage records to console", value=False, key="gen_debug_usage")
     st.header("Options")
     db_path = st.text_input("Database file", value=defaults.get("db", "jobs.db"), key="gen_db_path")
@@ -586,8 +635,9 @@ log(f"[candidates] pulled={raw_count} after_flags={after_flags} "
     f"after_filters={after_filters} requested={requested} shown={len(DISPLAY_JOBS)}")
 
 # Jinja2 template (once)
+template_path = get_template_path_by_id(_resume_templates, st.session_state.get("gen_template_id", _default_template_id))
 env = Environment(loader=FileSystemLoader("."))
-template = env.get_template(TEMPLATE_FILE)
+template = env.get_template(template_path)
 
 # Helper: unique file name in configured dir
 def unique_path(stem: str, ext: str) -> str:
@@ -981,6 +1031,7 @@ if DISPLAY_JOBS:
                             resume_path=saved_path,
                             resume_score=float(out_score),
                             resume_model=resume_model,
+                            resume_template=st.session_state.get("gen_template_id", _default_template_id),
                         )
                         if ok:
                             st.success(f"Saved → {saved_path}\nScore stored: {out_score:.3f}\nModel: {resume_model}")
