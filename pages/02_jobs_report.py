@@ -679,7 +679,7 @@ def _prep_section_df(rows):
     df = make_arrow_friendly(df)
     return df
 
-def _render_section(rows):
+def _render_section(label, rows):
     df = _prep_section_df(rows)
     if df.empty:
         st.info("No rows.")
@@ -693,6 +693,7 @@ def _render_section(rows):
     ]
     show_cols = [c for c in desired_cols if c in df.columns]
 
+    # Show simple dataframe and per-row JSON viewer (original behavior)
     st.dataframe(
         df[show_cols],
         use_container_width=True,
@@ -702,21 +703,48 @@ def _render_section(rows):
             "submitted": st.column_config.CheckboxColumn("Submitted"),
             "not_suitable": st.column_config.CheckboxColumn("Not suitable"),
             "url": st.column_config.LinkColumn("URL", display_text="Open"),
-            # keep resume_path as plain text (file:// varies by browser); remove if you prefer
         },
     )
 
+    try:
+        import re as _re
+        prefix = _re.sub(r"[^a-z0-9]+", "_", str(label).lower()).strip("_") or "sec"
+    except Exception:
+        prefix = str(label or "sec")
+
+    max_view = min(len(rows or []), 200)
+    with st.expander("View individual rows (JSON)"):
+        for idx in range(max_view):
+            job = rows[idx]
+            jid = job.get("job_id") or job.get("id") or f"r{idx}"
+            c_left, c_right = st.columns([8, 1])
+            with c_left:
+                t = job.get("title") or "(no title)"
+                co = job.get("company") or ""
+                src = job.get("source") or ""
+                st.write(f"**{t}** — {co}  ·  _{src}_")
+                with c_right:
+                    btn_key = f"view_{prefix}_{str(jid)}_{idx}"
+                    if st.button("View", key=btn_key):
+                        try:
+                            # Render the JSON in the left column so it's left-justified under the title
+                            with c_left:
+                                st.json(job)
+                        except Exception:
+                            with c_left:
+                                st.write(job)
+
 with tabA:
-    _render_section(sections.get("actionable"))
+    _render_section("Actionable", sections.get("actionable"))
 
 with tabS:
-    _render_section(sections.get("saved"))
+    _render_section("Saved", sections.get("saved"))
 
 with tabSub:
-    _render_section(sections.get("submitted"))
+    _render_section("Submitted", sections.get("submitted"))
 
 with tabNS:
-    _render_section(sections.get("not_suitable"))
+    _render_section("Not suitable", sections.get("not_suitable"))
 # ================== /Sectioned lists ==================
 
 st.subheader("🆕 New since window")

@@ -525,6 +525,24 @@ with st.sidebar:
         key="gen_template_id",
         format_func=_fmt_template,
     )
+    # Update preview dynamically when template changes
+    if "gen_cache" in st.session_state:
+        try:
+            template_path = get_template_path_by_id(_resume_templates, selected_template_id)
+            env = Environment(loader=FileSystemLoader("."))
+            template = env.get_template(template_path)
+            for row_key, cache in st.session_state.gen_cache.items():
+                html = template.render(
+                    header=st.session_state.get("header", {}),
+                    tailored_summary=cache.get("tailored_summary", ""),
+                    resume=cache.get("tailored", []),
+                )
+                # Render preview in the correct panel
+                st.markdown("### 📄 Resume Preview")
+                st.components.v1.html(html, height=700, scrolling=True)
+        except Exception as e:
+            st.error(f"Error rendering resume template: {e}")
+
     debug_usage_log = st.checkbox("Debug: print OpenAI usage records to console", value=False, key="gen_debug_usage")
     st.header("Options")
     db_path = st.text_input("Database file", value=defaults.get("db", "jobs.db"), key="gen_db_path")
@@ -790,7 +808,8 @@ if DISPLAY_JOBS:
 
             # Not suitable → reason + note; separate mini-form (no 'continue' here)
             with colC:
-                with st.expander("Not suitable", expanded=False):
+                # Use a unique expander label per row to avoid shared expanded state across repeated widgets
+                with st.expander(f"Not suitable — {row_key}", expanded=False):
                     ns_reason = st.selectbox(
                         "Reason",
                         [

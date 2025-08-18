@@ -413,6 +413,50 @@ def _collect_top_relevant_bullets(resume, scores_map, max_bullets=3):
                     return bullets
     return bullets[:max_bullets]
 
+def render_resume(preview_mode, selected_template_id):
+    """
+    Render the resume based on the selected preview mode and template.
+    """
+    if "tailored" not in st.session_state:
+        st.warning("No resume available. Please generate a resume first.")
+        return
+
+    try:
+        template_path = get_template_path_by_id(_resume_templates, selected_template_id)
+        env = Environment(loader=FileSystemLoader("templates"))
+        template = env.get_template(os.path.basename(template_path))
+        html = template.render(
+            header=st.session_state.get("header", {}),
+            tailored_summary=st.session_state.get("tailored_summary", ""),
+            resume=st.session_state.get("tailored", []),
+        )
+        st.session_state.generated_html = html
+
+        if preview_mode == "Formatted (HTML)":
+            st.components.v1.html(html, height=800, scrolling=True)
+        elif preview_mode == "Plain Text":
+            plain_text = re.sub(r"<[^>]+>", "", html)
+            st.text_area("Plain Text Resume", plain_text, height=800, key="ta_plain_text")
+        elif preview_mode == "PDF Preview":
+            try:
+                from weasyprint import HTML as WPHTML
+                import base64
+                from io import BytesIO
+
+                preview_buf = BytesIO()
+                WPHTML(string=html).write_pdf(preview_buf)
+                preview_pdf = preview_buf.getvalue()
+
+                b64_pdf = base64.b64encode(preview_pdf).decode("utf-8")
+                st.markdown(
+                    f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="800" type="application/pdf"></iframe>',
+                    unsafe_allow_html=True
+                )
+            except ImportError:
+                st.error("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF preview.")
+    except Exception as e:
+        st.error(f"Error rendering resume template: {e}")
+
 def _offline_cover_letter(header, company, role, tailored_summary, bullets):
     name = header.get("name", "")
     loc = header.get("location", "")
@@ -487,6 +531,8 @@ def generate_cover_letter(header, resume, scores_map, job_description, tailored_
     # Soft sanity trim
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text, company, role
+
+tailored_summary = ""  # Initialize tailored_summary to an empty string to avoid NameError.
 
 # ==== UI ====
 st.set_page_config(page_title="Tailored Resume Builder", layout="wide")
@@ -670,14 +716,51 @@ if "generated_html" in st.session_state:
 
     st.success("✅ Resume generated!")
 
-    # Downloads use the clean (non-highlighted) HTML
-    st.download_button(
-        "📥 Download Resume as HTML",
-        data=html,
-        file_name=f"{base_name}.html",
-        mime="text/html",
-        key="dl_resume_html"
-    )
+    # Preview mode
+    preview_mode = st.radio("Preview Mode", ("Formatted (HTML)", "Plain Text", "PDF Preview"), index=0, key="rad_preview_mode")
+    st.markdown("### 📄 Resume Preview")
+
+    # Call render_resume when preview mode changes
+    render_resume(preview_mode, selected_template_id)
+
+    # Generate Resume button
+    if st.button(f"Download {preview_mode} Formatted Resume", key="btn_download_resume"):
+        if preview_mode == "Formatted (HTML)":
+            st.download_button(
+                "📥 Download Resume as HTML",
+                data=html,
+                file_name=f"{base_name}.html",
+                mime="text/html",
+                key="dl_resume_html"
+            )
+        elif preview_mode == "Plain Text":
+            plain_text = re.sub(r"<[^>]+>", "", html)
+            st.download_button(
+                "📥 Download Resume as Plain Text",
+                data=plain_text,
+                file_name=f"{base_name}.txt",
+                mime="text/plain",
+                key="dl_resume_txt"
+            )
+        elif preview_mode == "PDF Preview":
+            try:
+                from weasyprint import HTML as WPHTML
+                import base64
+                from io import BytesIO
+
+                preview_buf = BytesIO()
+                WPHTML(string=html).write_pdf(preview_buf)
+                preview_pdf = preview_buf.getvalue()
+
+                st.download_button(
+                    "📥 Download Resume as PDF",
+                    data=preview_pdf,
+                    file_name=f"{base_name}.pdf",
+                    mime="application/pdf",
+                    key="dl_resume_pdf"
+                )
+            except ImportError:
+                st.error("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF download.")
 
     # Keyword chips (dark-mode safe)
     if matched:
@@ -724,153 +807,114 @@ if "generated_html" in st.session_state:
         else:
             st.write("Scores not available for this ordering.")
 
-    # Preview mode
-    preview_mode = st.radio("Preview Mode", ("Formatted (HTML)", "Plain Text", "PDF Preview"), index=0, key="rad_preview_mode")
-    st.markdown("### 📄 Resume Preview")
+# ========= Cover Letter =========
+st.markdown("---")
+st.subheader("✉️ Cover Letter")
 
-    if preview_mode == "Formatted (HTML)":
-        st.components.v1.html(highlighted_html, height=800, scrolling=True)
+gen_cover = st.checkbox("Generate a cover letter", value=False, key="chk_gen_cover")
+if gen_cover:
+    # Choose model re-use
+    cl_use_gpt = (summary_mode == "GPT-powered (API cost)") and st.checkbox(
+        "Use GPT for cover letter (API cost)", value=True, key="chk_cl_use_gpt"
+    )
+    cl_model = selected_model
+    if cl_use_gpt:
+        cl_model = st.selectbox(
+            "Cover letter model",
+            options=list(GPT_MODELS.keys()),
+            format_func=lambda m: f"{m} — {GPT_MODELS[m]}",
+            index=list(GPT_MODELS.keys()).index(selected_model) if selected_model in GPT_MODELS else 0,
+            key="sel_cl_model"
+        )
 
-    elif preview_mode == "Plain Text":
-        plain_text = re.sub(r"<[^>]+>", "", html)
-        st.text_area("Plain Text Resume", plain_text, height=800, key="ta_plain_text")
+    # Generate (once) or Regenerate
+    header_ss = st.session_state.get("header", {})
+    tailored_ss = st.session_state.get("tailored", [])
+    scores_map_ss = st.session_state.get("scores_map", {})
+    job_desc_ss = st.session_state.get("job_description", "")
+    tailored_summary_ss = st.session_state.get("tailored_summary", "")
 
-    elif preview_mode == "PDF Preview":
+    # Check if resume has been generated in this session
+    has_resume = "tailored" in st.session_state and st.session_state.get("tailored")
+    st.button("Generate Cover Letter", disabled=not has_resume, key="btn_cover_generate_gate")
+
+    if not has_resume:
+        st.info("Generate a tailored resume first, then create a cover letter.")
+
+    if has_resume and st.button("Generate Cover Letter", key="btn_cover_generate"):
+        # sanity fallback if user tries to generate a cover letter before generating resume
+        if not tailored_summary_ss:
+            # optionally regenerate a simple offline summary so we don't crash
+            tailored_summary_ss = generate_tailored_summary(
+                resume,
+                job_desc_ss or (st.session_state.get("job_description") or ""),
+                use_gpt=False
+            )
+
+        cl_text, cl_company, cl_role = generate_cover_letter(
+            header_ss,
+            tailored_ss,                 # use tailored sections for bullets
+            scores_map_ss,
+            job_desc_ss,
+            tailored_summary_ss,
+            use_gpt=cl_use_gpt,
+            model=cl_model
+        )
+        st.session_state.cover_letter_text = cl_text
+        st.session_state.cl_company = cl_company
+        st.session_state.cl_role = cl_role
+
+    # Editable preview textarea
+    if "cover_letter_text" in st.session_state:
+        st.markdown("You can edit before downloading:")
+        st.session_state.cover_letter_text = st.text_area(
+            "Cover Letter (editable)",
+            st.session_state.cover_letter_text,
+            height=400,
+            key="ta_cover_letter"
+        )
+
+        # Filenames
+        cl_company = st.session_state.get("cl_company") or extract_company_name(st.session_state.get("job_description","") or "")
+        cl_role = st.session_state.get("cl_role") or extract_role_title(st.session_state.get("job_description","") or "")
+        name_bits = []
+        if cl_company:
+            name_bits.append(_clean_for_filename(cl_company))
+        if cl_role:
+            name_bits.append(_clean_for_filename(cl_role))
+        base = "_".join(name_bits) + "_cover_letter" if name_bits else "cover_letter"
+
+        # Download as TXT
+        st.download_button(
+            "📥 Download Cover Letter (TXT)",
+            data=st.session_state.cover_letter_text,
+            file_name=f"{base}.txt",
+            mime="text/plain",
+            key="dl_cover_txt"
+        )
+
+        # Download as PDF (simple HTML wrapper)
         try:
             from weasyprint import HTML as WPHTML
-            import base64
-            from io import BytesIO
-
-            # Preview AND download should be generated from the CLEAN HTML (no highlights)
-            preview_buf = BytesIO()
-            WPHTML(string=html).write_pdf(preview_buf)   # use clean HTML, not highlighted_html
-            preview_pdf = preview_buf.getvalue()
-
-            b64_pdf = base64.b64encode(preview_pdf).decode("utf-8")
-            st.markdown(
-                f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="800" type="application/pdf"></iframe>',
-                unsafe_allow_html=True
-            )
-
+            cl_html = f"""<!doctype html><html><head>
+            <meta charset="utf-8">
+            <style>
+              body {{ font-family: Arial, sans-serif; font-size: 11pt; margin: 40px; }}
+              p {{ margin: 0 0 10px 0; }}
+              pre {{ white-space: pre-wrap; }}
+            </style></head><body>
+            <pre>{st.session_state.cover_letter_text}</pre>
+            </body></html>"""
+            buf = BytesIO()
+            WPHTML(string=cl_html).write_pdf(buf)
+            cl_pdf = buf.getvalue()
             st.download_button(
-                "📥 Download Resume as PDF",
-                data=preview_pdf,                     # same clean PDF as preview
-                file_name=f"{base_name}.pdf",
+                "📥 Download Cover Letter (PDF)",
+                data=cl_pdf,
+                file_name=f"{base}.pdf",
                 mime="application/pdf",
-                key="dl_resume_pdf"
+                key="dl_cover_pdf"
             )
-        except ImportError:
-            print("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF preview.")
-            st.error("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF preview.")
+        except Exception:
+            st.info("Install WeasyPrint to enable PDF cover letter download: `pip install weasyprint`")
 
-
-    # ========= Cover Letter =========
-    st.markdown("---")
-    st.subheader("✉️ Cover Letter")
-
-    gen_cover = st.checkbox("Generate a cover letter", value=False, key="chk_gen_cover")
-    if gen_cover:
-        # Choose model re-use
-        cl_use_gpt = (summary_mode == "GPT-powered (API cost)") and st.checkbox(
-            "Use GPT for cover letter (API cost)", value=True, key="chk_cl_use_gpt"
-        )
-        cl_model = selected_model
-        if cl_use_gpt:
-            cl_model = st.selectbox(
-                "Cover letter model",
-                options=list(GPT_MODELS.keys()),
-                format_func=lambda m: f"{m} — {GPT_MODELS[m]}",
-                index=list(GPT_MODELS.keys()).index(selected_model) if selected_model in GPT_MODELS else 0,
-                key="sel_cl_model"
-            )
-
-        # Generate (once) or Regenerate
-        header_ss = st.session_state.get("header", {})
-        tailored_ss = st.session_state.get("tailored", [])
-        scores_map_ss = st.session_state.get("scores_map", {})
-        job_desc_ss = st.session_state.get("job_description", "")
-        tailored_summary_ss = st.session_state.get("tailored_summary", "")
-
-        # Check if resume has been generated in this session
-        has_resume = "tailored" in st.session_state and st.session_state.get("tailored")
-        st.button("Generate Cover Letter", disabled=not has_resume, key="btn_cover_generate_gate")
-
-        if not has_resume:
-            st.info("Generate a tailored resume first, then create a cover letter.")
-
-        if has_resume and st.button("Generate Cover Letter", key="btn_cover_generate"):
-            # sanity fallback if user tries to generate a cover letter before generating resume
-            if not tailored_summary_ss:
-                # optionally regenerate a simple offline summary so we don't crash
-                tailored_summary_ss = generate_tailored_summary(
-                    resume,
-                    job_desc_ss or (st.session_state.get("job_description") or ""),
-                    use_gpt=False
-                )
-
-            cl_text, cl_company, cl_role = generate_cover_letter(
-                header_ss,
-                tailored_ss,                 # use tailored sections for bullets
-                scores_map_ss,
-                job_desc_ss,
-                tailored_summary_ss,
-                use_gpt=cl_use_gpt,
-                model=cl_model
-            )
-            st.session_state.cover_letter_text = cl_text
-            st.session_state.cl_company = cl_company
-            st.session_state.cl_role = cl_role
-
-        # Editable preview textarea
-        if "cover_letter_text" in st.session_state:
-            st.markdown("You can edit before downloading:")
-            st.session_state.cover_letter_text = st.text_area(
-                "Cover Letter (editable)",
-                st.session_state.cover_letter_text,
-                height=400,
-                key="ta_cover_letter"
-            )
-
-            # Filenames
-            cl_company = st.session_state.get("cl_company") or extract_company_name(st.session_state.get("job_description","") or "")
-            cl_role = st.session_state.get("cl_role") or extract_role_title(st.session_state.get("job_description","") or "")
-            name_bits = []
-            if cl_company:
-                name_bits.append(_clean_for_filename(cl_company))
-            if cl_role:
-                name_bits.append(_clean_for_filename(cl_role))
-            base = "_".join(name_bits) + "_cover_letter" if name_bits else "cover_letter"
-
-            # Download as TXT
-            st.download_button(
-                "📥 Download Cover Letter (TXT)",
-                data=st.session_state.cover_letter_text,
-                file_name=f"{base}.txt",
-                mime="text/plain",
-                key="dl_cover_txt"
-            )
-
-            # Download as PDF (simple HTML wrapper)
-            try:
-                from weasyprint import HTML as WPHTML
-                cl_html = f"""<!doctype html><html><head>
-                <meta charset="utf-8">
-                <style>
-                  body {{ font-family: Arial, sans-serif; font-size: 11pt; margin: 40px; }}
-                  p {{ margin: 0 0 10px 0; }}
-                  pre {{ white-space: pre-wrap; }}
-                </style></head><body>
-                <pre>{st.session_state.cover_letter_text}</pre>
-                </body></html>"""
-                buf = BytesIO()
-                WPHTML(string=cl_html).write_pdf(buf)
-                cl_pdf = buf.getvalue()
-                st.download_button(
-                    "📥 Download Cover Letter (PDF)",
-                    data=cl_pdf,
-                    file_name=f"{base}.pdf",
-                    mime="application/pdf",
-                    key="dl_cover_pdf"
-                )
-            except Exception:
-                st.info("Install WeasyPrint to enable PDF cover letter download: `pip install weasyprint`")

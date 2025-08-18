@@ -643,7 +643,7 @@ def set_job_status(db_path: Optional[str],
     init_db(db_path)
     try:
         now = utcnow()
-        sets, params = [], []
+        sets, params = []
         if status is not None:
             if status not in ALLOWED_STATUSES:
                 raise ValueError(f"Invalid status '{status}'. Allowed: {sorted(ALLOWED_STATUSES)}")
@@ -764,9 +764,57 @@ def mark_submitted(db_path: str, job_id: str, *, submitted: bool = True, submitt
         print(f"[job_store] mark_submitted error: {e}\n{traceback.format_exc()}")
         return False
 
+def mark_interviewed(db_path: str, job_id: str, *, interviewed: bool = True, interviewed_at: str | None = None) -> bool:
+    """
+    Mark/unmark a job as interviewed; records interviewed_at.
+    """
+    init_db(db_path)
+    try:
+        ts = interviewed_at or utcnow()
+        with connect(db_path) as conn:
+            where_sql, wparams = _where_by_any_key(conn, str(job_id))
+            if interviewed:
+                set_clause = "interviewed = 1, interviewed_at = ?, updated_at = ?"
+                params = (ts, ts)
+            else:
+                set_clause = "interviewed = 0, interviewed_at = NULL, updated_at = ?"
+                params = (ts,)
+            sql = f"UPDATE jobs SET {set_clause} WHERE {where_sql}"
+            cur = conn.execute(sql, (*params, *wparams))
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[job_store] mark_interviewed error: {e}\n{traceback.format_exc()}")
+        return False
+
+def mark_rejected(db_path: str, job_id: str, *, rejected: bool = True, rejected_at: str | None = None) -> bool:
+    """
+    Mark/unmark a job as rejected; records rejected_at.
+    """
+    init_db(db_path)
+    try:
+        ts = rejected_at or utcnow()
+        with connect(db_path) as conn:
+            where_sql, wparams = _where_by_any_key(conn, str(job_id))
+            if rejected:
+                set_clause = "rejected = 1, rejected_at = ?, updated_at = ?"
+                params = (ts, ts)
+            else:
+                set_clause = "rejected = 0, rejected_at = NULL, updated_at = ?"
+                params = (ts,)
+            sql = f"UPDATE jobs SET {set_clause} WHERE {where_sql}"
+            cur = conn.execute(sql, (*params, *wparams))
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception as e:
+        print(f"[job_store] mark_rejected error: {e}\n{traceback.format_exc()}")
+        return False
+
 # Back-compat aliases
 set_job_not_suitable = mark_not_suitable
 set_job_submitted    = mark_submitted
+set_job_interviewed = mark_interviewed
+set_job_rejected    = mark_rejected
 
 # =========================
 # Runs logging

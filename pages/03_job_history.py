@@ -36,6 +36,7 @@ from dotenv import load_dotenv
 
 import pandas as pd
 import streamlit as st
+import job_store
 
 from job_store import query_jobs, prune_duplicates
 
@@ -117,6 +118,20 @@ with st.sidebar:
         removed = prune_duplicates()
         st.success(f"Pruned {removed} duplicate rows.")
 
+    # Debug: authoritative DB-submitted view
+    if st.button("🔎 Show DB-submitted (authoritative)", use_container_width=True):
+        try:
+            db_sub_rows = job_store.query_submitted()
+            if db_sub_rows:
+                df_db = pd.DataFrame(db_sub_rows)
+                df_db = _arrow(df_db)
+                st.subheader(f"DB-submitted rows ({len(df_db)})")
+                st.dataframe(df_db, use_container_width=True, height=400)
+            else:
+                st.info("No submitted rows in DB.")
+        except Exception as e:
+            st.error(f"Error loading DB-submitted rows: {e}")
+
 # ---------- Date window ----------
 posted_start = None
 posted_end = None
@@ -161,13 +176,22 @@ for r in rows:
 
 # ---------- Counts ----------
 total = len(norm)
-submitted_ct = sum(1 for r in norm if r["submitted"])
+submitted_ct = sum(1 for r in norm if r["submitted"]) 
 ns_ct = sum(1 for r in norm if r["not_suitable"])
 neutral_ct = total - submitted_ct - ns_ct
 
+# Add DB authoritative submitted count for comparison
+try:
+    db_submitted_len = len(job_store.query_submitted())
+except Exception:
+    db_submitted_len = None
+
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Total (after filters)", total)
+# show UI submitted, and DB count as caption for quick comparison
 k2.metric("Submitted", submitted_ct)
+if db_submitted_len is not None:
+    k2.caption(f"DB-submitted (all): {db_submitted_len}")
 k3.metric("Not suitable", ns_ct)
 k4.metric("Neither", neutral_ct)
 
@@ -205,9 +229,8 @@ for i, tab in enumerate(tabs):
         if "job_id" in df.columns and "job_id" not in show_cols:
             show_cols = ["job_id"] + show_cols
         df = _arrow(df)
-        st.dataframe(
+        edited = st.data_editor(
             df[show_cols],
-            use_container_width=True,
             height=520,
             column_config={
                 "url": st.column_config.LinkColumn("URL", display_text="Open"),
@@ -216,7 +239,66 @@ for i, tab in enumerate(tabs):
                 "interviewed": st.column_config.CheckboxColumn("Interviewed"),
                 "rejected": st.column_config.CheckboxColumn("Rejected"),
             },
+            key=f"job_history_editor_{i}",
+            disabled=False,
+            hide_index=True,
+            use_container_width=True,
         )
+
+        # Persist edits: compare edited to original and update DB for checkbox changes
+        try:
+            if edited is not None and not edited.empty:
+                # edited will have columns matching show_cols; use job_id or id to identify
+                id_col = "job_id" if "job_id" in edited.columns else ("id" if "id" in edited.columns else None)
+                if id_col:
+                    for idx, row in edited.iterrows():
+                        key = row.get(id_col)
+                        orig = df.loc[df[id_col] == key].squeeze() if id_col in df.columns else None
+                        if orig is None:
+                            continue
+                        # submitted
+                        if "submitted" in row and bool(row["submitted"]) != bool(orig.get("submitted")):
+                            try:
+                                from job_store import mark_submitted
+                                mark_submitted(None, key, submitted=bool(row["submitted"]))
+                            except Exception:
+                                pass
+                        # not_suitable
+                        if "not_suitable" in row and bool(row["not_suitable"]) != bool(orig.get("not_suitable")):
+                            try:
+                                from job_store import mark_not_suitable
+                                if bool(row["not_suitable"]):
+                                    mark_not_suitable(None, key)
+                                else:
+                                    # unmarking: set not_suitable=0 and clear timestamp
+                                    try:
+                                        from job_store import connect, utcnow as _js_utcnow
+                                        with connect(None) as conn:
+                                            where_sql = "job_id = ? OR id = ? OR url = ? OR hash_key = ?"
+                                            params = (str(key), str(key), str(key), str(key))
+                                            conn.execute(f"UPDATE jobs SET not_suitable = 0, not_suitable_at = NULL, updated_at = ? WHERE {where_sql}", (_js_utcnow(), *params))
+                                            conn.commit()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        # interviewed
+                        if "interviewed" in row and bool(row["interviewed"]) != bool(orig.get("interviewed")):
+                            try:
+                                from job_store import mark_interviewed
+                                mark_interviewed(None, key, interviewed=bool(row["interviewed"]))
+                            except Exception:
+                                pass
+                        # rejected
+                        if "rejected" in row and bool(row["rejected"]) != bool(orig.get("rejected")):
+                            try:
+                                from job_store import mark_rejected
+                                mark_rejected(None, key, rejected=bool(row["rejected"]))
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+
         with st.expander("Show advanced columns (timestamps, resume path/score)"):
             adv_cols = [
                 "job_id", "status", "user_notes", "first_seen", "last_seen", "updated_at",

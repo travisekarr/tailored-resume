@@ -13,3 +13,6 @@ modular_resume_full.yaml
 
 # Saved Resumes
 kept_resumes/
+
+#database
+jobs.db

@@ -8,6 +8,11 @@ defaults:
   dedupe_key: "company|title|canonical_url"
   min_score: 0.0
   fetch_full_descriptions: true   # turn enrichment on/off
+  exclude_archived: true
+  max_posting_age: 30
+  minimum_salary: 140000
+  minimum_hourly: 70
+  exclude_hybrid: true
 
   # Optional tuning (shown with sensible defaults):
   enrichment:
@@ -21,7 +26,7 @@ defaults:
 
 filters:
   include: ["engineering manager", "devops", "sre", "software development", "development manager", "director engineering", "netsuite","platform", "kubernetes", "aws", "ci/cd"]
-  exclude: ["intern", "senior analyst"]
+  exclude: ["intern", "senior analyst", "hybrid", "junior", "entry level"]
 
 aggregators:
 
