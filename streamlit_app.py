@@ -439,21 +439,21 @@ def render_resume(preview_mode, selected_template_id):
             st.text_area("Plain Text Resume", plain_text, height=800, key="ta_plain_text")
         elif preview_mode == "PDF Preview":
             try:
-                from weasyprint import HTML as WPHTML
+                import pdfkit
                 import base64
                 from io import BytesIO
 
-                preview_buf = BytesIO()
-                WPHTML(string=html).write_pdf(preview_buf)
-                preview_pdf = preview_buf.getvalue()
+                # Generate PDF using pdfkit
+                pdf_data = pdfkit.from_string(html, False)
 
-                b64_pdf = base64.b64encode(preview_pdf).decode("utf-8")
+                # Encode PDF for inline display
+                b64_pdf = base64.b64encode(pdf_data).decode("utf-8")
                 st.markdown(
                     f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="800" type="application/pdf"></iframe>',
                     unsafe_allow_html=True
                 )
             except ImportError:
-                st.error("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF preview.")
+                st.error("pdfkit is not installed. Run `pip install pdfkit` to enable PDF preview.")
     except Exception as e:
         st.error(f"Error rendering resume template: {e}")
 
@@ -744,23 +744,17 @@ if "generated_html" in st.session_state:
             )
         elif preview_mode == "PDF Preview":
             try:
-                from weasyprint import HTML as WPHTML
-                import base64
-                from io import BytesIO
-
-                preview_buf = BytesIO()
-                WPHTML(string=html).write_pdf(preview_buf)
-                preview_pdf = preview_buf.getvalue()
-
+                import pdfkit
+                pdf_data = pdfkit.from_string(html, False)
                 st.download_button(
                     "📥 Download Resume as PDF",
-                    data=preview_pdf,
+                    data=pdf_data,
                     file_name=f"{base_name}.pdf",
                     mime="application/pdf",
                     key="dl_resume_pdf"
                 )
             except ImportError:
-                st.error("WeasyPrint is not installed. Run `pip install weasyprint` to enable PDF download.")
+                st.error("pdfkit is not installed. Run `pip install pdfkit` to enable PDF download.")
 
     # Keyword chips (dark-mode safe)
     if matched:

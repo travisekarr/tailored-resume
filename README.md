@@ -62,7 +62,9 @@ Tailored Resume Builder is a Python/Streamlit application that aggregates job li
 - Streamlit
 - OpenAI API key (for embeddings/scoring)
 - SQLite (default jobs.db)
-- Optional: WeasyPrint (for PDF export)
+- Optional: WeasyPrint (for some PDF export flows, e.g., cover letters)
+- pdfkit Python package (for primary resume PDF export)
+  - Requires wkhtmltopdf installed on your system and available on PATH
 - Other dependencies: see `requirements.txt`
 
 ## Quick Start
@@ -89,6 +91,25 @@ Tailored Resume Builder is a Python/Streamlit application that aggregates job li
    TIMEZONE=America/New_York
    DATETIME_DISPLAY_FORMAT=%Y-%m-%d:%I-%M %p
    ```
+
+3a. Install wkhtmltopdf (required for pdfkit-based PDFs):
+
+- Windows: Download the installer from <https://wkhtmltopdf.org/downloads.html> and install.
+  - Ensure the installer adds the binary to PATH, e.g., `C:\\Program Files\\wkhtmltopdf\\bin`.
+  - Verify in a new terminal:
+
+  ```powershell
+  wkhtmltopdf --version
+  ```
+
+- macOS: `brew install wkhtmltopdf`
+- Linux (Debian/Ubuntu): `sudo apt-get install wkhtmltopdf`
+
+3b. (Optional) WeasyPrint for cover letters:
+
+  ```bash
+  pip install weasyprint
+  ```
 
 4. Run the application:
 
@@ -132,12 +153,40 @@ Tailored Resume Builder is a Python/Streamlit application that aggregates job li
 
 - Configure job sources in `sources.yaml`
 - Adjust model/pricing in `openai_pricing.yaml`
-- Change resume templates in `tailored_resume_template.html`
+- Change resume templates in `tailored_resume_template.html` or `templates/tailored_resume_modern_template.html`
 
-## Troubleshooting
+## PDF Export
+
+- The main resume PDF export uses `pdfkit` (wkhtmltopdf under the hood) for better CSS support.
+- Make sure `wkhtmltopdf` is installed and on PATH. If the installer didn’t set PATH, you can add it manually or configure it in code:
+
+  ```python
+  import pdfkit
+  config = pdfkit.configuration(wkhtmltopdf=r"C:\\Program Files\\wkhtmltopdf\\bin\\wkhtmltopdf.exe")
+  pdf_data = pdfkit.from_string(html, False, configuration=config)
+  ```
+
+- Some flows (like Cover Letter PDF) may still use WeasyPrint. Install it if you want that feature.
+
+### Download behavior
+
+- The Download button under the preview pane downloads based on the selected preview mode:
+  - Formatted (HTML): downloads .html
+  - Plain Text: downloads .txt
+  - PDF Preview: downloads .pdf (uses pdfkit/wkhtmltopdf)
+
+### Troubleshooting (PDF)
+
+- If you see “pdfkit is not installed”: `pip install pdfkit`
+- If you see “wkhtmltopdf not found” or PDFs fail silently:
+  - Open a new terminal and run `wkhtmltopdf --version`
+  - Add wkhtmltopdf bin to PATH (Windows): `C:\\Program Files\\wkhtmltopdf\\bin`
+  - Or pass an explicit configuration to pdfkit (see code snippet above)
+- For WeasyPrint issues on Windows, install with extras: `pip install weasyprint[visual]`
+
+## Troubleshooting (General)
 
 - Ensure your OpenAI API key is set in `.env`
-- For PDF export, install WeasyPrint: `pip install weasyprint`
 - Use CLI tools for database fixes and migrations
 
 ## License

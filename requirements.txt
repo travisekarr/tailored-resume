@@ -7,6 +7,9 @@ python-dotenv>=1.0.0
 openai>=1.99.9
 
 # PDF generation
+# Primary engine for resumes (requires wkhtmltopdf installed on the system)
+pdfkit>=1.0.0
+# Legacy/optional engine still used for cover letters and some flows
 weasyprint>=59.0
 
 # Optional: to ensure consistent HTML parsing for highlights

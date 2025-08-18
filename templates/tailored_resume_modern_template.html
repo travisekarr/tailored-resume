@@ -1,10 +1,41 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
 	<meta charset="UTF-8">
 	<title>{{ header.name }} - Resume</title>
 	<style>
+		/**
+body {
+  margin: 0;
+  padding: 0;
+  font-family: sans-serif;
+}
+
+.holder {
+	max-width: fit-content;
+	display: flex;
+}
+
+.sidebar {
+  display: inline-block;
+  width: 250px;
+  padding: 1rem;
+  box-sizing: border-box;
+}
+
+.content {
+  padding: 1rem;
+  box-sizing: border-box;
+  float: left;
+}
+
+@page {
+  size: A4;
+  margin: .5in;
+}
+**/
+
+
 		body {
 			font-family: 'Roboto', Arial, sans-serif;
 			background: #f5f6fa;
@@ -12,44 +43,22 @@
 			margin: 0;
 			padding: 0;
 		}
-		.main {
-			display: flex;
+		.holder {
 			max-width: 1100px;
 			margin: 40px auto;
 			background: #fff;
 			border-radius: 12px;
 			box-shadow: 0 2px 16px rgba(0,0,0,0.08);
-			overflow: hidden;
-		}
-		@media print {
-			.main {
-				/* Keep flexbox for double-column layout */
-				display: flex !important;
-				max-width: 1000px;
-				margin: 0;
-				box-shadow: none;
-				border-radius: 0;
-			}
-			.sidebar {
-				width: 280px !important;
-				padding: 10px 10px 0 10px !important;
-                background: #2F2F2F;
-                color: #c0c0c0;
-				page-break-after: avoid;
-			}
-			.content {
-				flex: 1;
-				padding: 10px 10px 0 10px !important;
-			}
+			padding: 20px;
+			position: relative;
 		}
 		.sidebar {
 			background: #2F2F2F;
-            color: #c0c0c0;
-			width: 320px;
+			color: #c0c0c0;
+			width: 25%;
 			padding: 32px 24px;
-			display: flex;
-			flex-direction: column;
-			align-items: flex-start;
+			float: left;
+			margin-right: 20px;
 		}
 		.sidebar h1 {
 			color: #FFFFFF;
@@ -101,34 +110,19 @@
 			margin-top: 1em;
 		}
 		.content {
-			flex: 1;
-			padding: 40px 48px 40px 48px;
+			padding: 20px 48px 40px 48px;
 		}
-		.section-title {
+		.content-section-title {
 			font-size: 1.5em;
 			font-weight: bold;
 			color: #222;
 			margin-bottom: 0.5em;
-			margin-top: 1.5em;
+			margin-top: 0.5em;
 		}
-		.achievement {
-			margin-bottom: 1.2em;
-		}
-		.achievement-icon {
-			display: inline-block;
-			vertical-align: middle;
-			margin-right: 8px;
-			color: #87CEEE;
-		}
-		.achievement-title {
-			font-weight: bold;
-			font-size: 1.08em;
-			margin-bottom: 0.2em;
-		}
-		.achievement-desc {
-			margin-left: 28px;
-			color: #444;
-			font-size: 0.98em;
+		.content-summary {
+			font-size: 0.9em;
+			color: #222;
+			margin-top: 0.5em;
 		}
 		.job {
 			margin-bottom: 2em;
@@ -163,16 +157,37 @@
 		.job-contributions {
 			margin-left: 0;
 			padding-left: 0;
+			/* list-style: none; /* remove default bullets so we can use custom graphic */
 		}
 		.job-contributions li {
+			position: relative;
 			margin-bottom: 0.5em;
 			color: #222;
 			font-size: 0.98em;
+			margin-left: 3em;
+			list-style:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%233a7bd5'><circle cx='8' cy='8' r='6'/></svg>"); /* remove default bullets so we can use custom graphic */
+			/*list-style-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%233a7bd5'><circle cx='8' cy='8' r='6'/></svg>"); /* remove default bullets so we can use custom graphic */
 		}
+		/*.job-contributions li::before {
+			position: relative;
+			content: ".     .";
+		}
+		/* Custom bullet using inline SVG so it works offline and in PDF 
+		.job-contributions li::before {
+			content: " ";
+			display: inline-block;
+			position: relative;
+			background: no-repeat center/contain url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%233a7bd5'><circle cx='8' cy='8' r='6'/></svg>");
+			vertical-align: middle;
+		}
+
+		@media print {
+			.job-contributions li::before { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+		}
+		*/
 	</style>
-</head>
-<body>
-	<div class="main">
+
+	<div class="holder">
 		<div class="sidebar">
 			<h1>{{ header.name }}</h1>
 			<div class="title">{{ header.title }}</div>
@@ -228,12 +243,24 @@
 		{% endfor %}
 		</div>
 		<div class="content">
-			<div class="section-title">Summary</div>
-			<div class="summary">{{ tailored_summary }}</div>
+			<div class="content-section-title">Summary</div>
+			<div class="content-summary">{{ tailored_summary }}</div>
 
-			<div class="section-title">Professional Experience</div>
 			{% for section in resume %}
-				{% if section.type == 'experience' %}
+				{% if section.type == 'summary' %}
+				<div class="section">
+					<div class="content-section-title">{{ section.title }}</div>
+					<div class="content-summary">{{ section.summary }}</div>
+				</div>
+
+				{% elif section.type == 'skills' or section.id.startswith('tech_') %}
+				<div class="section">
+					<div class="content-section-title">{{ section.title }}</div>
+					<div class="content-summary">{{ section.summary }}</div>
+				</div>
+
+				{% elif section.type == 'experience' %}
+				<div class="content-section-title">Professional Experience</div>
 					<div class="job">
 						<div class="job-header">
 							<span class="job-title">{{ section.title }}</span>
