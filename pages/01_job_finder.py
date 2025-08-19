@@ -29,6 +29,8 @@ from datetime import datetime
 
 from job_hunter import hunt_jobs, probe_sources, load_sources_yaml
 from job_store import store_jobs
+from job_store import count_jobs, record_job_pull_history
+from job_store import fetch_job_pull_history
 
 
 # Model config helpers
@@ -255,6 +257,7 @@ http_container = st.empty()
 debug_container = st.empty()
 download_container = st.empty()
 store_container = st.empty()
+history_container = st.empty()
 
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
@@ -303,17 +306,64 @@ if run:
         )
 
     stats = res.get("stats", {})
+    # Back-compat fallbacks
+    after_remote   = stats.get("after_remote", stats.get("after_remote_filter", 0))
+    after_filter   = stats.get("after_filter", stats.get("after_keyword_filters", 0))
+    after_dedupe   = stats.get("after_dedupe", 0)
+    after_defaults = stats.get("after_defaults", 0)
+    final_count    = stats.get("final_count", res.get("count", 0))
     stats_container.info(
         f"Stage counts → raw: {stats.get('raw_total',0)}, "
-        f"after remote-only: {stats.get('after_remote_filter',0)}, "
-        f"after keyword filters: {stats.get('after_keyword_filters',0)}, "
-        f"after de-dupe: {stats.get('after_dedupe',0)}, "
-        f"after threshold/max: {stats.get('after_threshold',0)}"
+        f"after remote-only: {after_remote}, "
+        f"after keyword filters: {after_filter}, "
+        f"after de-dupe: {after_dedupe}, "
+        f"after defaults: {after_defaults}, "
+        f"final: {final_count}"
     )
 
     if save_to_db and res["count"]:
         info = store_jobs(res["items"])
         store_container.success(f"Saved to DB — inserted/updated: {info.get('inserted',0)}/{info.get('updated',0)}")
+        # Record pull history snapshot
+        try:
+            total_jobs = count_jobs(None)
+            stats = res.get("stats", {})
+            params = res.copy()
+            # capture embedding params if present
+            use_emb = bool(params.get("use_embeddings", False))
+            emb_model = params.get("embedding_model") or ""
+            ordering = params.get("ordering") or ""
+            # NEW: capture inserted/updated and include in stats + top-level (best-effort)
+            inserted = int(info.get("inserted", 0) or 0)
+            updated = int(info.get("updated", 0) or 0)
+            stats_ext = dict(stats)
+            stats_ext["inserted"] = inserted
+            stats_ext["updated"] = updated
+            try:
+                record_job_pull_history(
+                    db_path=None,
+                    pulled_at=res.get("generated_at"),
+                    use_embeddings=use_emb,
+                    embedding_model=emb_model,
+                    ordering=ordering,
+                    stats=stats_ext,
+                    jobs_total=total_jobs,
+                    inserted=inserted,   # <-- NEW (if supported by job_store)
+                    updated=updated,     # <-- NEW (if supported by job_store)
+                )
+            except TypeError:
+                # Back-compat: function without explicit inserted/updated kwargs
+                record_job_pull_history(
+                    db_path=None,
+                    pulled_at=res.get("generated_at"),
+                    use_embeddings=use_emb,
+                    embedding_model=emb_model,
+                    ordering=ordering,
+                    stats=stats_ext,
+                    jobs_total=total_jobs,
+                )
+        except Exception as e:
+            print(f"[01_job_finder] record_job_pull_history failed: {e}")
 
     # Quick links
     if res["count"]:
@@ -364,6 +414,107 @@ if run:
                         st.json(ev["data"])
         else:
             debug_container.info("No debug events captured. Enable 'Show debug logs' and run again.")
+
+    # Pull History (always show the most recent N; default sort DESC)
+    try:
+        history = fetch_job_pull_history(None, limit=50, order_desc=True)
+    except Exception as e:
+        print(f"[01_job_finder] fetch_job_pull_history failed: {e}")
+        history = []
+    with history_container.container():
+        st.markdown("### 📜 Pull History")
+        if not history:
+            st.info("No pull history yet. Run a fetch with 'Save results to jobs.db' enabled.")
+        else:
+            import pandas as _pd
+            import json as _json
+
+            def _fmt_dt(x):
+                try:
+                    return format_dt(x)
+                except Exception:
+                    return str(x or "")
+
+            # NEW: helpers to extract nested values and safe ints
+            def _to_int(v, default=0):
+                try:
+                    if v is None or v == "":
+                        return default
+                    return int(v)
+                except Exception:
+                    try:
+                        return int(float(v))
+                    except Exception:
+                        return default
+
+            def _get_nested(h: dict, key: str):
+                # top-level first
+                if key in h and h[key] not in (None, ""):
+                    return h[key]
+                # look inside stats/stats_json/payload (dict or JSON string)
+                for sk in ("stats", "stats_json", "payload"):
+                    s = h.get(sk)
+                    if not s:
+                        continue
+                    if isinstance(s, str):
+                        try:
+                            s = _json.loads(s)
+                        except Exception:
+                            s = None
+                    if isinstance(s, dict) and key in s and s[key] not in (None, ""):
+                        return s[key]
+                return None
+
+            # Compute fallback "New" from Jobs Total deltas (descending order)
+            # First, normalize jobs_total per row
+            def _jobs_total(h):
+                v = h.get("jobs_total")
+                if v in (None, "", 0, "0"):
+                    v = _get_nested(h, "jobs_total")
+                return _to_int(v, 0)
+
+            jobs_totals = [_jobs_total(h) for h in history]
+            fallback_new = []
+            for i in range(len(history)):
+                if i + 1 < len(history):
+                    delta = jobs_totals[i] - jobs_totals[i + 1]
+                    fallback_new.append(max(delta, 0))
+                else:
+                    fallback_new.append(0)
+
+            rows = []
+            for i, h in enumerate(history):
+                ins = _get_nested(h, "inserted")
+                upd = _get_nested(h, "updated")
+                # Accept some alternate keys just in case
+                if ins in (None, ""):
+                    ins = _get_nested(h, "new")
+                if ins in (None, ""):
+                    ins = 0
+                if upd in (None, ""):
+                    upd = 0
+                ins = _to_int(ins, 0)
+                upd = _to_int(upd, 0)
+                # If inserted missing/zero, use fallback based on Jobs Total delta
+                if ins == 0 and fallback_new[i] > 0:
+                    ins = fallback_new[i]
+
+                rows.append({
+                    "Pulled At": _fmt_dt(h.get("pulled_at") or h.get("created_at")),
+                    "Embeddings": (f"Yes ({h.get('embedding_model')})" if h.get("use_embeddings") else "No"),
+                    "Ordering": h.get("ordering") or "",
+                    "New": ins,                         # <-- NEW
+                    "Updated": upd,                     # <-- NEW
+                    "Raw": _to_int(_get_nested(h, "raw_total") or h.get("raw_total") or 0),
+                    "After Remote": _to_int(_get_nested(h, "after_remote") or h.get("after_remote") or 0),
+                    "After Filter": _to_int(_get_nested(h, "after_filter") or h.get("after_filter") or 0),
+                    "After Dedupe": _to_int(_get_nested(h, "after_dedupe") or h.get("after_dedupe") or 0),
+                    "Final": _to_int(_get_nested(h, "final_count") or h.get("final_count") or 0),
+                    "Jobs Total": jobs_totals[i],
+                })
+
+            df = _pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, height=260)
 
 # ---------- Download last JSON ----------
 if download:

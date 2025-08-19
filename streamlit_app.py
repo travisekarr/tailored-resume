@@ -58,27 +58,17 @@ RESUME_PATH = "modular_resume_full.yaml"
 _resume_templates = load_resume_templates()
 _default_template_id = get_default_template_id(_resume_templates)
 
+# Feature flags
+# Temporarily disable Cover Letter UI until refactor/fix is complete
+ENABLE_COVER_LETTER = False
+
 # --- Setup ---
 load_dotenv()
 #print("OPENAI_API_KEY:", os.environ.get("OPENAI_API_KEY"))
 client = OpenAI()
 
-# ----- Sidebar Model Pickers -----
-with st.sidebar:
-    st.markdown("---")
-    st.subheader("Model Selection")
-    embedding_model_sel = _model_selectbox(
-        "Embeddings model",
-        group="embeddings",
-        key="app_embed_model",
-        disabled=False,
-    )
-    gpt_model_sel = _model_selectbox(
-        "GPT model",
-        group="rephrasing",
-        key="app_gpt_model",
-        disabled=False,
-    )
+# Configure Streamlit early (must be before any other st.* calls)
+st.set_page_config(page_title="Tailored Resume Builder", layout="wide")
 
 # ----- Model/pricing directories -----
 GPT_MODELS = {
@@ -91,6 +81,55 @@ EMBED_MODELS = {
     "text-embedding-3-small": "$0.02 / 1M tokens",
     "text-embedding-3-large": "$0.13 / 1M tokens",
 }
+
+# ----- Sidebar: Usage & Models -----
+with st.sidebar:
+    st.markdown("### Usage & Models")
+    summary_mode = st.radio("Summary Mode", ("Offline (free)", "GPT-powered (API cost)"), index=0, key="rad_summary_mode")
+    strict_mode = summary_mode == "GPT-powered (API cost)" and st.checkbox(
+        "Strict factual mode (no new claims)", value=True,
+        help="Model may only rephrase supplied facts. No new achievements or metrics.",
+        key="chk_strict_mode"
+    )
+    selected_model = st.selectbox(
+        "GPT Model (pricing per 1K tokens):",
+        options=list(GPT_MODELS.keys()),
+        format_func=lambda m: f"{m} — {GPT_MODELS[m]}",
+        index=0,
+        key="sel_gpt_model"
+    )
+
+    st.markdown("---")
+    st.markdown("### Experience Enhancements")
+    add_impact = st.checkbox("Add tailored impact statements (per role)", value=False, key="chk_add_impact")
+    bullets_per_role = 1
+    if add_impact:
+        bullets_per_role = st.slider("Impact bullets per role", 1, 3, 1, key="sld_bullets_per_role")
+    show_generated = st.checkbox("Show generated impact statements", value=True, key="chk_show_generated")
+
+    st.markdown("---")
+    st.markdown("### Matching Options")
+    use_embeddings = st.checkbox("Use semantic matching (OpenAI embeddings)", value=False, key="chk_use_embeddings")
+    embedding_model = st.selectbox(
+        "Embeddings model (pricing per 1M tokens):",
+        options=list(EMBED_MODELS.keys()),
+        format_func=lambda m: f"{m} — {EMBED_MODELS[m]}",
+        index=0,
+        disabled=not use_embeddings,
+        key="sel_embed_model"
+    )
+
+    st.markdown("---")
+    st.markdown("### Tools")
+    if st.button("Clear embeddings cache", key="btn_clear_cache"):
+        try:
+            clear_embeddings_cache()
+            st.success("Embeddings cache cleared.")
+        except Exception as e:
+            print(f"[streamlit_app] Error clearing embeddings cache: {e}")
+            st.info("No cache file found or unable to clear.")
+
+ 
 
 # ----- Company name extraction from Job Description -----
 def _clean_slug(s: str) -> str:
@@ -348,10 +387,37 @@ def generate_tailored_summary(
     opening_line = f"{title} with {years_exp}+ years of proven expertise" if years_exp else f"{title} with proven expertise"
 
     job_keywords = set(word.lower() for word in job_description.split() if len(word) > 2)
+
+    # Flatten tags across sections, supporting {hard,soft} dicts and
+    # creating simple separator variants for robust matching ("ci_cd" <-> "ci/cd").
+    def _flatten_tags(tags):
+        if isinstance(tags, dict):
+            vals = []
+            vals.extend(tags.get("hard", []) or [])
+            vals.extend(tags.get("soft", []) or [])
+            return [str(t).strip().lower() for t in vals if t]
+        elif isinstance(tags, list):
+            return [str(t).strip().lower() for t in tags if t]
+        return []
+
+    def _tag_variants(t: str) -> set[str]:
+        v = {t}
+        # generate common separator/delimiter variants
+        v.add(t.replace("_", "/"))
+        v.add(t.replace("/", "_"))
+        v.add(t.replace("-", "_"))
+        v.add(t.replace("_", "-"))
+        v.add(t.replace("_", " "))  # space variant (e.g., sql_server -> sql server)
+        # dot variants (e.g., node.js -> nodejs, node js)
+        v.add(t.replace(".", ""))
+        v.add(t.replace(".", " "))
+        return {x for x in v if x}
+
     all_resume_tags = set()
     for section in resume:
-        if "tags" in section:
-            all_resume_tags.update(tag.lower() for tag in section["tags"])
+        tags = section.get("tags")
+        for t in _flatten_tags(tags):
+            all_resume_tags.update(_tag_variants(t))
 
     matched_skills = sorted(list(job_keywords & all_resume_tags))
     top_skills_str = ", ".join(matched_skills[:4]) if matched_skills else None
@@ -452,9 +518,11 @@ def render_resume(preview_mode, selected_template_id):
                     f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="800" type="application/pdf"></iframe>',
                     unsafe_allow_html=True
                 )
-            except ImportError:
+            except ImportError as e:
+                print(f"[streamlit_app] PDF preview error (pdfkit missing): {e}")
                 st.error("pdfkit is not installed. Run `pip install pdfkit` to enable PDF preview.")
     except Exception as e:
+        print(f"[streamlit_app] Error in render_resume: {e}")
         st.error(f"Error rendering resume template: {e}")
 
 def _offline_cover_letter(header, company, role, tailored_summary, bullets):
@@ -535,19 +603,8 @@ def generate_cover_letter(header, resume, scores_map, job_description, tailored_
 tailored_summary = ""  # Initialize tailored_summary to an empty string to avoid NameError.
 
 # ==== UI ====
-st.set_page_config(page_title="Tailored Resume Builder", layout="wide")
 st.title("🎯 Tailored Resume Generator")
 
-# Sidebar: cache controls
-with st.sidebar:
-    st.markdown("### Tools")
-    if st.button("Clear embeddings cache", key="btn_clear_cache"):
-        try:
-            clear_embeddings_cache()
-            st.success("Embeddings cache cleared.")
-        except Exception as e:
-            print(f"Error clearing embeddings cache: {e}")
-            st.info("No cache file found or unable to clear.")
 
 st.markdown("Paste a job description below and click **Generate Resume** to get a customized resume based on your experience.")
 
@@ -578,34 +635,8 @@ with col1:
     highlight = st.checkbox("Highlight matches in preview", value=True, key="chk_highlight")
 
 with col2:
-    summary_mode = st.radio("Summary Mode", ("Offline (free)", "GPT-powered (API cost)"), index=0, key="rad_summary_mode")
-    strict_mode = summary_mode == "GPT-powered (API cost)" and st.checkbox(
-        "Strict factual mode (no new claims)", value=True,
-        help="Model may only rephrase supplied facts. No new achievements or metrics.",
-        key="chk_strict_mode"
-    )
-    selected_model = st.selectbox(
-        "GPT Model (pricing per 1K tokens):",
-        options=list(GPT_MODELS.keys()),
-        format_func=lambda m: f"{m} — {GPT_MODELS[m]}",
-        index=0,
-        key="sel_gpt_model"
-    )
-    add_impact = st.checkbox("Add tailored impact statements (per role)", value=False, key="chk_add_impact")
-    bullets_per_role = 1
-    if add_impact:
-        bullets_per_role = st.slider("Impact bullets per role", 1, 3, 1, key="sld_bullets_per_role")
-    show_generated = st.checkbox("Show generated impact statements", value=True, key="chk_show_generated")
-    # Embeddings options
-    use_embeddings = st.checkbox("Use semantic matching (OpenAI embeddings)", value=False, key="chk_use_embeddings")
-    embedding_model = st.selectbox(
-        "Embeddings model (pricing per 1M tokens):",
-        options=list(EMBED_MODELS.keys()),
-        format_func=lambda m: f"{m} — {EMBED_MODELS[m]}",
-        index=0,
-        disabled=not use_embeddings,
-        key="sel_embed_model"
-    )
+    # Options moved to sidebar to match Generate From Jobs
+    st.empty()
 
 # Generate
 if st.button("Generate Tailored Resume", use_container_width=True, key="btn_generate_resume"):
@@ -623,6 +654,7 @@ if st.button("Generate Tailored Resume", use_container_width=True, key="btn_gene
                 embedding_model=embedding_model if use_embeddings else "text-embedding-3-small",
             )
         except Exception as e:
+            print(f"[streamlit_app] Error generating tailored resume: {e}")
             st.error(f"Error generating tailored resume: {e}")
             tailored, scores_map = [], {}
 
@@ -638,6 +670,7 @@ if st.button("Generate Tailored Resume", use_container_width=True, key="btn_gene
                     bullets_per_role=bullets_per_role,
                 )
             except Exception as e:
+                print(f"[streamlit_app] Error adding impact statements: {e}")
                 st.error(f"Error adding impact statements: {e}")
 
         # Hide generated impact if the user unchecks it
@@ -659,6 +692,7 @@ if st.button("Generate Tailored Resume", use_container_width=True, key="btn_gene
                 embedding_model=(embedding_model if use_embeddings else "text-embedding-3-small"),
             )
         except Exception as e:
+            print(f"[streamlit_app] Error generating tailored summary: {e}")
             st.error(f"Error generating tailored summary: {e}")
             tailored_summary = ""
 
@@ -670,6 +704,7 @@ if st.button("Generate Tailored Resume", use_container_width=True, key="btn_gene
             if not html.strip():
                 st.warning("Resume preview is empty. Please check your template and resume data.")
         except Exception as e:
+            print(f"[streamlit_app] Error rendering template: {e}")
             st.error(f"Error rendering resume template: {e}")
             html = ""
 
@@ -677,6 +712,7 @@ if st.button("Generate Tailored Resume", use_container_width=True, key="btn_gene
         try:
             highlighted_html = highlight_html(html, job_description) if highlight else html
         except Exception as e:
+            print(f"[streamlit_app] Error in highlight_html: {e}")
             st.error(f"Error highlighting resume preview: {e}")
             highlighted_html = html
 
@@ -686,6 +722,7 @@ if st.button("Generate Tailored Resume", use_container_width=True, key="btn_gene
             resume_text = " ".join((section_text(s) or "").lower() for s in resume)
             matched = sorted([w for w in jd_words if w in resume_text], key=len, reverse=True)[:50]
         except Exception as e:
+            print(f"[streamlit_app] Error building keyword chips: {e}")
             matched = []
 
         # Company slug derived from JD (for filenames)
@@ -693,6 +730,7 @@ if st.button("Generate Tailored Resume", use_container_width=True, key="btn_gene
             company_slug = extract_company_name(job_description)
             base_name = f"{company_slug}_full_resume" if company_slug else "full_resume"
         except Exception as e:
+            print(f"[streamlit_app] Company slug extraction failed: {e}")
             base_name = "full_resume"
 
         st.session_state.generated_html = html
@@ -723,38 +761,43 @@ if "generated_html" in st.session_state:
     # Call render_resume when preview mode changes
     render_resume(preview_mode, selected_template_id)
 
-    # Generate Resume button
-    if st.button(f"Download {preview_mode} Formatted Resume", key="btn_download_resume"):
-        if preview_mode == "Formatted (HTML)":
-            st.download_button(
-                "📥 Download Resume as HTML",
-                data=html,
-                file_name=f"{base_name}.html",
-                mime="text/html",
-                key="dl_resume_html"
-            )
-        elif preview_mode == "Plain Text":
-            plain_text = re.sub(r"<[^>]+>", "", html)
-            st.download_button(
-                "📥 Download Resume as Plain Text",
-                data=plain_text,
-                file_name=f"{base_name}.txt",
-                mime="text/plain",
-                key="dl_resume_txt"
-            )
-        elif preview_mode == "PDF Preview":
-            try:
-                import pdfkit
-                pdf_data = pdfkit.from_string(html, False)
-                st.download_button(
-                    "📥 Download Resume as PDF",
-                    data=pdf_data,
-                    file_name=f"{base_name}.pdf",
-                    mime="application/pdf",
-                    key="dl_resume_pdf"
-                )
-            except ImportError:
-                st.error("pdfkit is not installed. Run `pip install pdfkit` to enable PDF download.")
+    # Single download button based on preview mode
+    download_label = None
+    download_data = None
+    download_mime = None
+    download_name = None
+
+    if preview_mode == "Formatted (HTML)":
+        download_label = "📥 Download Resume as HTML"
+        download_data = html
+        download_mime = "text/html"
+        download_name = f"{base_name}.html"
+    elif preview_mode == "Plain Text":
+        plain_text = re.sub(r"<[^>]+>", "", html)
+        download_label = "📥 Download Resume as Plain Text"
+        download_data = plain_text
+        download_mime = "text/plain"
+        download_name = f"{base_name}.txt"
+    elif preview_mode == "PDF Preview":
+        try:
+            import pdfkit
+            pdf_data = pdfkit.from_string(html, False)
+            download_label = "📥 Download Resume as PDF"
+            download_data = pdf_data
+            download_mime = "application/pdf"
+            download_name = f"{base_name}.pdf"
+        except ImportError as e:
+            print(f"[streamlit_app] PDF download error (pdfkit missing): {e}")
+            st.error("pdfkit is not installed. Run `pip install pdfkit` to enable PDF download.")
+
+    if download_data is not None:
+        st.download_button(
+            download_label,
+            data=download_data,
+            file_name=download_name,
+            mime=download_mime,
+            key="dl_resume",
+        )
 
     # Keyword chips (dark-mode safe)
     if matched:
@@ -802,113 +845,118 @@ if "generated_html" in st.session_state:
             st.write("Scores not available for this ordering.")
 
 # ========= Cover Letter =========
-st.markdown("---")
-st.subheader("✉️ Cover Letter")
+# NOTE: Disabled via feature flag until the cover letter flow is fixed/refactored.
+if ENABLE_COVER_LETTER:
+    st.markdown("---")
+    st.subheader("✉️ Cover Letter")
 
-gen_cover = st.checkbox("Generate a cover letter", value=False, key="chk_gen_cover")
-if gen_cover:
-    # Choose model re-use
-    cl_use_gpt = (summary_mode == "GPT-powered (API cost)") and st.checkbox(
-        "Use GPT for cover letter (API cost)", value=True, key="chk_cl_use_gpt"
-    )
-    cl_model = selected_model
-    if cl_use_gpt:
-        cl_model = st.selectbox(
-            "Cover letter model",
-            options=list(GPT_MODELS.keys()),
-            format_func=lambda m: f"{m} — {GPT_MODELS[m]}",
-            index=list(GPT_MODELS.keys()).index(selected_model) if selected_model in GPT_MODELS else 0,
-            key="sel_cl_model"
+    gen_cover = st.checkbox("Generate a cover letter", value=False, key="chk_gen_cover")
+    if gen_cover:
+        # Choose model re-use
+        cl_use_gpt = (summary_mode == "GPT-powered (API cost)") and st.checkbox(
+            "Use GPT for cover letter (API cost)", value=True, key="chk_cl_use_gpt"
         )
-
-    # Generate (once) or Regenerate
-    header_ss = st.session_state.get("header", {})
-    tailored_ss = st.session_state.get("tailored", [])
-    scores_map_ss = st.session_state.get("scores_map", {})
-    job_desc_ss = st.session_state.get("job_description", "")
-    tailored_summary_ss = st.session_state.get("tailored_summary", "")
-
-    # Check if resume has been generated in this session
-    has_resume = "tailored" in st.session_state and st.session_state.get("tailored")
-    st.button("Generate Cover Letter", disabled=not has_resume, key="btn_cover_generate_gate")
-
-    if not has_resume:
-        st.info("Generate a tailored resume first, then create a cover letter.")
-
-    if has_resume and st.button("Generate Cover Letter", key="btn_cover_generate"):
-        # sanity fallback if user tries to generate a cover letter before generating resume
-        if not tailored_summary_ss:
-            # optionally regenerate a simple offline summary so we don't crash
-            tailored_summary_ss = generate_tailored_summary(
-                resume,
-                job_desc_ss or (st.session_state.get("job_description") or ""),
-                use_gpt=False
+        cl_model = selected_model
+        if cl_use_gpt:
+            cl_model = st.selectbox(
+                "Cover letter model",
+                options=list(GPT_MODELS.keys()),
+                format_func=lambda m: f"{m} — {GPT_MODELS[m]}",
+                index=list(GPT_MODELS.keys()).index(selected_model) if selected_model in GPT_MODELS else 0,
+                key="sel_cl_model"
             )
 
-        cl_text, cl_company, cl_role = generate_cover_letter(
-            header_ss,
-            tailored_ss,                 # use tailored sections for bullets
-            scores_map_ss,
-            job_desc_ss,
-            tailored_summary_ss,
-            use_gpt=cl_use_gpt,
-            model=cl_model
-        )
-        st.session_state.cover_letter_text = cl_text
-        st.session_state.cl_company = cl_company
-        st.session_state.cl_role = cl_role
+        # Generate (once) or Regenerate
+        header_ss = st.session_state.get("header", {})
+        tailored_ss = st.session_state.get("tailored", [])
+        scores_map_ss = st.session_state.get("scores_map", {})
+        job_desc_ss = st.session_state.get("job_description", "")
+        tailored_summary_ss = st.session_state.get("tailored_summary", "")
 
-    # Editable preview textarea
-    if "cover_letter_text" in st.session_state:
-        st.markdown("You can edit before downloading:")
-        st.session_state.cover_letter_text = st.text_area(
-            "Cover Letter (editable)",
-            st.session_state.cover_letter_text,
-            height=400,
-            key="ta_cover_letter"
-        )
+        # Check if resume has been generated in this session
+        has_resume = "tailored" in st.session_state and st.session_state.get("tailored")
+        st.button("Generate Cover Letter", disabled=not has_resume, key="btn_cover_generate_gate")
 
-        # Filenames
-        cl_company = st.session_state.get("cl_company") or extract_company_name(st.session_state.get("job_description","") or "")
-        cl_role = st.session_state.get("cl_role") or extract_role_title(st.session_state.get("job_description","") or "")
-        name_bits = []
-        if cl_company:
-            name_bits.append(_clean_for_filename(cl_company))
-        if cl_role:
-            name_bits.append(_clean_for_filename(cl_role))
-        base = "_".join(name_bits) + "_cover_letter" if name_bits else "cover_letter"
+        if not has_resume:
+            st.info("Generate a tailored resume first, then create a cover letter.")
 
-        # Download as TXT
-        st.download_button(
-            "📥 Download Cover Letter (TXT)",
-            data=st.session_state.cover_letter_text,
-            file_name=f"{base}.txt",
-            mime="text/plain",
-            key="dl_cover_txt"
-        )
+        if has_resume and st.button("Generate Cover Letter", key="btn_cover_generate"):
+            # sanity fallback if user tries to generate a cover letter before generating resume
+            if not tailored_summary_ss:
+                # optionally regenerate a simple offline summary so we don't crash
+                tailored_summary_ss = generate_tailored_summary(
+                    resume,
+                    job_desc_ss or (st.session_state.get("job_description") or ""),
+                    use_gpt=False
+                )
 
-        # Download as PDF (simple HTML wrapper)
-        try:
-            from weasyprint import HTML as WPHTML
-            cl_html = f"""<!doctype html><html><head>
-            <meta charset="utf-8">
-            <style>
-              body {{ font-family: Arial, sans-serif; font-size: 11pt; margin: 40px; }}
-              p {{ margin: 0 0 10px 0; }}
-              pre {{ white-space: pre-wrap; }}
-            </style></head><body>
-            <pre>{st.session_state.cover_letter_text}</pre>
-            </body></html>"""
-            buf = BytesIO()
-            WPHTML(string=cl_html).write_pdf(buf)
-            cl_pdf = buf.getvalue()
+            cl_text, cl_company, cl_role = generate_cover_letter(
+                header_ss,
+                tailored_ss,                 # use tailored sections for bullets
+                scores_map_ss,
+                job_desc_ss,
+                tailored_summary_ss,
+                use_gpt=cl_use_gpt,
+                model=cl_model
+            )
+            st.session_state.cover_letter_text = cl_text
+            st.session_state.cl_company = cl_company
+            st.session_state.cl_role = cl_role
+
+        # Editable preview textarea
+        if "cover_letter_text" in st.session_state:
+            st.markdown("You can edit before downloading:")
+            st.session_state.cover_letter_text = st.text_area(
+                "Cover Letter (editable)",
+                st.session_state.cover_letter_text,
+                height=400,
+                key="ta_cover_letter"
+            )
+
+            # Filenames
+            cl_company = st.session_state.get("cl_company") or extract_company_name(st.session_state.get("job_description","") or "")
+            cl_role = st.session_state.get("cl_role") or extract_role_title(st.session_state.get("job_description","") or "")
+            name_bits = []
+            if cl_company:
+                name_bits.append(_clean_for_filename(cl_company))
+            if cl_role:
+                name_bits.append(_clean_for_filename(cl_role))
+            base = "_".join(name_bits) + "_cover_letter" if name_bits else "cover_letter"
+
+            # Download as TXT
             st.download_button(
-                "📥 Download Cover Letter (PDF)",
-                data=cl_pdf,
-                file_name=f"{base}.pdf",
-                mime="application/pdf",
-                key="dl_cover_pdf"
+                "📥 Download Cover Letter (TXT)",
+                data=st.session_state.cover_letter_text,
+                file_name=f"{base}.txt",
+                mime="text/plain",
+                key="dl_cover_txt"
             )
-        except Exception:
-            st.info("Install WeasyPrint to enable PDF cover letter download: `pip install weasyprint`")
+
+            # Download as PDF (simple HTML wrapper)
+            try:
+                from weasyprint import HTML as WPHTML
+                cl_html = f"""<!doctype html><html><head>
+                <meta charset="utf-8">
+                <style>
+                  body {{ font-family: Arial, sans-serif; font-size: 11pt; margin: 40px; }}
+                  p {{ margin: 0 0 10px 0; }}
+                  pre {{ white-space: pre-wrap; }}
+                </style></head><body>
+                <pre>{st.session_state.cover_letter_text}</pre>
+                </body></html>"""
+                buf = BytesIO()
+                WPHTML(string=cl_html).write_pdf(buf)
+                cl_pdf = buf.getvalue()
+                st.download_button(
+                    "📥 Download Cover Letter (PDF)",
+                    data=cl_pdf,
+                    file_name=f"{base}.pdf",
+                    mime="application/pdf",
+                    key="dl_cover_pdf"
+                )
+            except Exception:
+                st.info("Install WeasyPrint to enable PDF cover letter download: `pip install weasyprint`")
+else:
+    # Hidden for now; will be re-enabled in a future refactor
+    pass
 

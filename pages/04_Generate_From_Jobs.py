@@ -65,7 +65,8 @@ def format_dt(val):
         tz = pytz.timezone(TZ)
         dt = dt.tz_convert(tz)
         return dt.strftime(DT_FMT)
-    except Exception:
+    except Exception as e:
+        print(f"[04_Generate_From_Jobs] format_dt error: {e}")
         return str(val)
 # _openai_client = OpenAI()  # replaced by openai_utils
 
@@ -490,7 +491,8 @@ def generate_tailored_summary_strict(resume, job_description, use_gpt=False, mod
 
     outline = _build_summary_outline(title, years_exp, top_hard_str or top_soft_str, achievement)
     try:
-        templated = _safe_paraphrase_with_placeholders(outline, title, years_exp, top_hard_str or top_soft_str, achievement)
+        # was incorrectly passing (outline, title, years_exp, skills, achievement)
+        templated = _safe_paraphrase_with_placeholders(outline, model)
         final = _substitute_placeholders(templated, title, years_exp, top_hard_str or top_soft_str, achievement)
         return final
     except Exception:
@@ -541,6 +543,7 @@ with st.sidebar:
                 st.markdown("### 📄 Resume Preview")
                 st.components.v1.html(html, height=700, scrolling=True)
         except Exception as e:
+            print(f"[04_Generate_From_Jobs] Error rendering resume template in sidebar preview: {e}")
             st.error(f"Error rendering resume template: {e}")
 
     debug_usage_log = st.checkbox("Debug: print OpenAI usage records to console", value=False, key="gen_debug_usage")
@@ -800,7 +803,8 @@ if DISPLAY_JOBS:
 
         with st.container():
             st.write(f"**{title} — {company}**  |  score: `{score:.3f}`  |  [open]({url})")
-            colA, colB, colC, colD = st.columns([1,1,1,2])
+            cols = st.columns([1,1,1,2])
+            colA, colB, colC, colD = cols
             with colA:
                 gen_btn = st.button("Generate Resume", key=f"gen_{row_key}")
             with colB:
@@ -838,7 +842,7 @@ if DISPLAY_JOBS:
                     )
                     ns_save = st.button("Save not suitable", key=f"ns_save_{row_key}")
 
-            with colD:
+            with cols[3]:
                 sub_btn = st.button("Mark Submitted", key=f"sub_{row_key}")
 
             # Handle Not suitable
@@ -906,6 +910,7 @@ if DISPLAY_JOBS:
                             model=debug_options["summary_gpt_model"]
                         )
                 except Exception as e:
+                    print(f"[04_Generate_From_Jobs] Summary generation failed: {e}")
                     st.warning(f"Summary generation failed, omitting summary: {e}")
                     log("Summary failed:\n" + traceback.format_exc())
 
@@ -918,6 +923,7 @@ if DISPLAY_JOBS:
                             tailored, jd_text, use_gpt=True, model=debug_options["bullets_gpt_model"]
                         )
                 except Exception as e:
+                    print(f"[04_Generate_From_Jobs] Bullet paraphrase failed: {e}")
                     st.warning(f"Bullet paraphrase failed (using unmodified bullets): {e}")
                     log("Paraphrase failed:\n" + traceback.format_exc())
 
@@ -925,6 +931,7 @@ if DISPLAY_JOBS:
                 try:
                     html = template.render(header=header, tailored_summary=tailored_summary, resume=tailored)
                 except Exception as e:
+                    print(f"[04_Generate_From_Jobs] Template render failed: {e}")
                     st.error(f"Template render failed: {e}")
                     log("Template render failed:\n" + traceback.format_exc())
                     continue
@@ -935,6 +942,7 @@ if DISPLAY_JOBS:
                     out_score = tfidf_score(gen_text, jd_text)
                 except Exception as e:
                     out_score = 0.0
+                    print(f"[04_Generate_From_Jobs] Scoring failed: {e}")
                     st.warning(f"Scoring failed, setting score=0.0: {e}")
                     log("Scoring failed:\n" + traceback.format_exc())
 
@@ -952,7 +960,8 @@ if DISPLAY_JOBS:
                     buf = BytesIO()
                     WPHTML(string=html).write_pdf(buf)
                     pdf_bytes = buf.getvalue()
-                except Exception:
+                except Exception as e:
+                    print(f"[04_Generate_From_Jobs] WeasyPrint PDF generation failed: {e}")
                     log("WeasyPrint failed:\n" + traceback.format_exc())
 
                 # Cache it for Keep/Preview on next reruns
@@ -999,6 +1008,7 @@ if DISPLAY_JOBS:
                         os.makedirs(save_dir, exist_ok=True)
                         log(f"[keep-click] dir={save_dir} key={row_key}")
                     except Exception as e:
+                        print(f"[04_Generate_From_Jobs] Cannot create save folder: {e}")
                         st.error(f"Cannot create save folder: {save_dir}\n\n{e}")
                         log("Create dir failed:\n" + traceback.format_exc())
                         st.stop()
@@ -1012,6 +1022,7 @@ if DISPLAY_JOBS:
                             raise RuntimeError(f"HTML save did not create file: {html_path}")
                         log(f"[save-html] {html_path}")
                     except Exception as e:
+                        print(f"[04_Generate_From_Jobs] Failed saving HTML: {e}")
                         st.error(f"Failed saving HTML to {save_dir}\n\n{e}")
                         log("Save HTML failed:\n" + traceback.format_exc())
                         st.stop()
@@ -1028,6 +1039,7 @@ if DISPLAY_JOBS:
                             saved_path = pdf_path
                             log(f"[save-pdf] {pdf_path}")
                         except Exception as e:
+                            print(f"[04_Generate_From_Jobs] PDF save failed: {e}")
                             st.warning(f"PDF save failed, keeping HTML only:\n\n{e}")
                             log("Save PDF failed:\n" + traceback.format_exc())
 
@@ -1064,6 +1076,7 @@ if DISPLAY_JOBS:
                             st.warning("Saved files, but DB update returned 0 rows (job not found by job_id or id).")
                             log("[db-update] 0 rows updated")
                     except Exception as e:
+                        print(f"[04_Generate_From_Jobs] DB update failed: {e}")
                         st.error(f"Saved files, but DB update failed:\n\n{e}")
                         log("DB update failed:\n" + traceback.format_exc())
 
@@ -1129,12 +1142,14 @@ if submitted_rows:
                     set_job_status(defaults.get("db", "jobs.db"), job_id, interviewed=int(row["interviewed"]), interviewed_at=datetime.now(timezone.utc).isoformat())
                     st.success(f"Interviewed flag updated for {job_id}")
                 except Exception as e:
+                    print(f"[04_Generate_From_Jobs] Failed to update interviewed: {e}")
                     st.error(f"Failed to update interviewed: {e}")
             if row["rejected"] != bool(int(orig_row.get("rejected") or 0)):
                 try:
                     set_job_status(defaults.get("db", "jobs.db"), job_id, rejected=int(row["rejected"]), rejected_at=datetime.now(timezone.utc).isoformat())
                     st.success(f"Rejected flag updated for {job_id}")
                 except Exception as e:
+                    print(f"[04_Generate_From_Jobs] Failed to update rejected: {e}")
                     st.error(f"Failed to update rejected: {e}")
 else:
     st.info("No submitted jobs yet.")

@@ -1,5 +1,4 @@
 
-
 # Tailored Resume Builder
 
 ## Project Structure
@@ -76,7 +75,7 @@ Tailored Resume Builder is a Python/Streamlit application that aggregates job li
    cd tailored-resume
    ```
 
-2. Install dependencies:
+1. Install dependencies:
 
    ```bash
    python -m venv venv
@@ -84,7 +83,7 @@ Tailored Resume Builder is a Python/Streamlit application that aggregates job li
    pip install -r requirements.txt
    ```
 
-3. Set up your `.env` file:
+1. Set up your `.env` file:
 
    ```env
    OPENAI_API_KEY=your-key-here
@@ -92,7 +91,7 @@ Tailored Resume Builder is a Python/Streamlit application that aggregates job li
    DATETIME_DISPLAY_FORMAT=%Y-%m-%d:%I-%M %p
    ```
 
-3a. Install wkhtmltopdf (required for pdfkit-based PDFs):
+1. Install wkhtmltopdf (required for pdfkit-based PDFs):
 
 - Windows: Download the installer from <https://wkhtmltopdf.org/downloads.html> and install.
   - Ensure the installer adds the binary to PATH, e.g., `C:\\Program Files\\wkhtmltopdf\\bin`.
@@ -105,13 +104,13 @@ Tailored Resume Builder is a Python/Streamlit application that aggregates job li
 - macOS: `brew install wkhtmltopdf`
 - Linux (Debian/Ubuntu): `sudo apt-get install wkhtmltopdf`
 
-3b. (Optional) WeasyPrint for cover letters:
+1. (Optional) Install WeasyPrint for cover letters:
 
   ```bash
   pip install weasyprint
   ```
 
-4. Run the application:
+1. Run the application:
 
    ```bash
    streamlit run streamlit_app.py

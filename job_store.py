@@ -1139,3 +1139,143 @@ def query_changed_since(db_path: Optional[str],
             "job_id": d.get("job_id"),
         })
     return events
+
+# =========================
+# Aggregate counts & pull history
+# =========================
+def count_jobs(db_path: Optional[str] = None) -> int:
+    """Return total number of rows in jobs table."""
+    init_db(db_path)
+    try:
+        with connect(db_path) as conn:
+            (n,) = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
+            return int(n)
+    except Exception as e:
+        print(f"[job_store] count_jobs error: {e}\n{traceback.format_exc()}")
+        return 0
+
+def count_new_since(db_path: Optional[str], since_iso: str, *, min_score: float = 0.0, hide_stale_days: Optional[int] = None) -> int:
+    """Return count matching the same criteria used by query_new_since, without a LIMIT."""
+    init_db(db_path)
+    try:
+        since_iso = _to_iso_compat(since_iso)
+        where = ["(COALESCE(pulled_at, created_at) > ?)", "(score >= ?)"]
+        params: list[Any] = [since_iso, float(min_score)]
+        if hide_stale_days:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=int(hide_stale_days))).isoformat()
+            where.append("COALESCE(pulled_at, created_at) >= ?"); params.append(cutoff)
+        sql = f"SELECT COUNT(*) FROM jobs WHERE {' AND '.join(where)}"
+        with connect(db_path) as conn:
+            (n,) = conn.execute(sql, params).fetchone()
+            return int(n)
+    except Exception as e:
+        print(f"[job_store] count_new_since error: {e}\n{traceback.format_exc()}")
+        return 0
+
+def _ensure_pull_history_table(conn: sqlite3.Connection):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS job_pull_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pulled_at TEXT,
+            use_embeddings INTEGER,
+            embedding_model TEXT,
+            ordering TEXT,
+            raw_total INTEGER,
+            after_remote INTEGER,
+            after_filter INTEGER,
+            after_dedupe INTEGER,
+            final_count INTEGER,
+            jobs_total INTEGER,
+            stats_json TEXT,
+            created_at TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_job_pull_history_pulled_at ON job_pull_history(pulled_at)")
+
+def record_job_pull_history(
+    *,
+    db_path: Optional[str] = None,
+    pulled_at: Optional[str] = None,
+    use_embeddings: bool = False,
+    embedding_model: Optional[str] = None,
+    ordering: Optional[str] = None,
+    stats: Optional[dict] = None,
+    jobs_total: Optional[int] = None,
+) -> int:
+    """Insert one row capturing a run's summary and current jobs table size."""
+    init_db(db_path)
+    try:
+        now = utcnow()
+        with connect(db_path) as conn:
+            _ensure_pull_history_table(conn)
+            cur = conn.cursor()
+            st = stats or {}
+            cur.execute(
+                """
+                INSERT INTO job_pull_history (
+                    pulled_at, use_embeddings, embedding_model, ordering,
+                    raw_total, after_remote, after_filter, after_dedupe, final_count,
+                    jobs_total, stats_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    pulled_at or now,
+                    1 if use_embeddings else 0,
+                    embedding_model or "",
+                    ordering or "",
+                    int(st.get("raw_total") or 0),
+                    int(st.get("after_remote") or 0),
+                    int(st.get("after_filter") or 0),
+                    int(st.get("after_dedupe") or 0),
+                    int(st.get("final_count") or 0),
+                    int(jobs_total or 0),
+                    json.dumps(st, ensure_ascii=False),
+                    now,
+                ),
+            )
+            rid = int(cur.lastrowid)
+            conn.commit()
+            return rid
+    except Exception as e:
+        print(f"[job_store] record_job_pull_history error: {e}\n{traceback.format_exc()}")
+        return 0
+
+def fetch_job_pull_history(
+    db_path: Optional[str] = None,
+    *,
+    limit: int = 100,
+    order_desc: bool = True,
+) -> list[dict]:
+    """Return recent job pull history rows, newest first by default."""
+    init_db(db_path)
+    try:
+        with connect(db_path) as conn:
+            _ensure_pull_history_table(conn)
+            order = "DESC" if order_desc else "ASC"
+            rows = conn.execute(
+                f"""
+                SELECT id, pulled_at, use_embeddings, embedding_model, ordering,
+                       raw_total, after_remote, after_filter, after_dedupe, final_count,
+                       jobs_total, stats_json, created_at
+                  FROM job_pull_history
+                 ORDER BY COALESCE(pulled_at, created_at) {order}
+                 LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        cols = [
+            "id","pulled_at","use_embeddings","embedding_model","ordering",
+            "raw_total","after_remote","after_filter","after_dedupe","final_count",
+            "jobs_total","stats_json","created_at"
+        ]
+        out: list[dict] = []
+        for r in rows:
+            d = {cols[i]: r[i] for i in range(len(cols))}
+            d["use_embeddings"] = bool(d.get("use_embeddings"))
+            out.append(d)
+        return out
+    except Exception as e:
+        print(f"[job_store] fetch_job_pull_history error: {e}\n{traceback.format_exc()}")
+        return []

@@ -1386,7 +1386,15 @@ def hunt_jobs(
 
     # ------ STAGE 2: include/exclude keyword filters
     def _s(x: str):
-        return str(x or "").strip().lower() if x else None
+        """Safe string normalizer that never returns None.
+
+        Converts input to a lowercase, stripped string; returns empty string for None/falsey.
+        """
+        try:
+            return (str(x or "").strip().lower())
+        except Exception:
+            # Best-effort fallback
+            return ""
     include_set = set(include)
     exclude_set = set(exclude)
     def _filter_keywords(items: List[dict], incl: set, excl: set) -> List[dict]:
@@ -1419,7 +1427,10 @@ def hunt_jobs(
     # ------ STAGE 4: scoring (embeddings or TF-IDF)
     if use_embeddings:
         # 4a: Embeddings
-        all_texts = [resume_text] + [it.get("title") + " " + (it.get("description") or "") for it in items]
+        all_texts = [resume_text] + [
+            (it.get("title") or "") + " " + (it.get("description") or "")
+            for it in items
+        ]
         try:
             scores = _score_embeddings(resume_text, all_texts, embedding_model, logs)
             for i, it in enumerate(items):
@@ -1428,12 +1439,24 @@ def hunt_jobs(
             print(f"Error scoring with embeddings: {e}")
             _log(logs, "score.embeddings.error", {"error": str(e)})
             # Fallback to TF-IDF
-            scores = _score_tfidf(resume_text, [it.get("title") + " " + (it.get("description") or "") for it in items])
+            scores = _score_tfidf(
+                resume_text,
+                [
+                    (it.get("title") or "") + " " + (it.get("description") or "")
+                    for it in items
+                ],
+            )
             for i, it in enumerate(items):
                 it["score"] = scores[i]
     else:
         # 4b: TF-IDF
-        scores = _score_tfidf(resume_text, [it.get("title") + " " + (it.get("description") or "") for it in items])
+        scores = _score_tfidf(
+            resume_text,
+            [
+                (it.get("title") or "") + " " + (it.get("description") or "")
+                for it in items
+            ],
+        )
         for i, it in enumerate(items):
             it["score"] = scores[i]
 
@@ -1537,11 +1560,11 @@ def hunt_jobs(
     except Exception as e:
         _log(logs, "auto_mark.error", {"error": str(e)})
 
-    # ------ FINAL: sort by score (highest first)
+    # ------ FINAL: sort by score (highest first) and apply optional limit
     items.sort(key=lambda it: it.get("score", 0), reverse=True)
-    final_count = len(items)
-    if max_results > 0 and final_count > max_results:
+    if max_results > 0 and len(items) > max_results:
         items = items[:max_results]
+    final_count = len(items)
 
     # Log summary
     _log(logs, "hunt.summary", {
@@ -1549,6 +1572,7 @@ def hunt_jobs(
         "after_remote": after_remote,
         "after_filter": after_filter,
         "after_dedupe": after_dedupe,
+        "after_defaults": after_defaults,
         "final_count": final_count,
     })
     return {
@@ -1560,7 +1584,10 @@ def hunt_jobs(
             "after_remote": after_remote,
             "after_filter": after_filter,
             "after_dedupe": after_dedupe,
+            "after_defaults": after_defaults,
             "final_count": final_count,
+            "raw_counts_by_source": dict(raw_counts),
+            "after_remote_counts_by_source": dict(s1_counts),
             "errors": [],
         },
         "debug": logs,

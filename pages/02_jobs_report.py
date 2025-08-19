@@ -52,6 +52,8 @@ from job_store import (
     clear_jobs_data, 
     nuke_database,
     query_sections_for_report,
+    count_jobs,
+    count_new_since,
 )
 
 # ====== OPTIONAL: load resume to build profile terms for score debugging ======
@@ -109,7 +111,8 @@ def format_dt(val):
         tz = pytz.timezone(TZ)
         dt = dt.tz_convert(tz)
         return dt.strftime(DT_FMT)
-    except Exception:
+    except Exception as e:
+        print(f"[02_jobs_report] format_dt error: {e}")
         return str(val)
 def load_defaults(path=DEFAULTS_PATH):
     if not os.path.exists(path):
@@ -288,19 +291,38 @@ def _load_resume_terms(path=RESUME_PATH) -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             sections = yaml.safe_load(f) or []
-    except Exception:
+    except Exception as e:
+        print(f"[02_jobs_report] _load_resume_terms YAML load error: {e}")
         return {"tags": set(), "tokens": set()}
 
     tags = set()
     tokens = set()
 
+    def _flatten_tags(tags_obj):
+        if isinstance(tags_obj, dict):
+            out = []
+            out.extend(tags_obj.get("hard", []) or [])
+            out.extend(tags_obj.get("soft", []) or [])
+            return [str(t).strip().lower() for t in out if t]
+        elif isinstance(tags_obj, list):
+            return [str(t).strip().lower() for t in tags_obj if t]
+        return []
+
+    def _variants(t: str) -> set[str]:
+        v = {t}
+        v.add(t.replace("_", "/"))
+        v.add(t.replace("/", "_"))
+        v.add(t.replace("-", "_"))
+        v.add(t.replace("_", "-"))
+        return {x for x in v if x}
+
     for sec in sections:
         if isinstance(sec, dict):
             # tags
-            for t in (sec.get("tags") or []):
-                t2 = str(t).strip().lower()
-                if t2 and t2 not in STOPWORDS:
-                    tags.add(t2)
+            for t in _flatten_tags(sec.get("tags")):
+                for tv in _variants(t):
+                    if tv and tv not in STOPWORDS:
+                        tags.add(tv)
             # summaries/entries
             if "summary" in sec and sec["summary"]:
                 for tok in _tokenize(sec["summary"]):
@@ -645,12 +667,26 @@ st.subheader("📌 Sectioned lists")
 sections = query_sections_for_report(db_path=db_path, limit_per=int(limit_per))
 
 # Quick counts
+try:
+    total_records = count_jobs(db_path)
+except Exception as e:
+    print(f"[02_jobs_report] count_jobs failed: {e}")
+    total_records = 0
+
+try:
+    total_new = count_new_since(db_path, since_iso, min_score=float(min_score), hide_stale_days=hide_days)
+except Exception as e:
+    print(f"[02_jobs_report] count_new_since failed: {e}")
+    total_new = 0
+
 st.write(
     f"**Counts** — "
     f"Actionable: `{len(sections.get('actionable', []))}` · "
     f"Saved: `{len(sections.get('saved', []))}` · "
     f"Submitted: `{len(sections.get('submitted', []))}` · "
-    f"Not suitable: `{len(sections.get('not_suitable', []))}`"
+    f"Not suitable: `{len(sections.get('not_suitable', []))}` · "
+    f"Total Records: `{total_records}` · "
+    f"Total New: `{total_new}`"
 )
 
 tabA, tabS, tabSub, tabNS = st.tabs(["Actionable", "Saved", "Submitted", "Not suitable"])
@@ -708,8 +744,9 @@ def _render_section(label, rows):
 
     try:
         import re as _re
-        prefix = _re.sub(r"[^a-z0-9]+", "_", str(label).lower()).strip("_") or "sec"
-    except Exception:
+        prefix = _re.sub(r"[^a-z0-9]+", "_", str(label or "").lower()).strip("_") or "sec"
+    except Exception as e:
+        print(f"[02_jobs_report] Regex prefix build failed for label={label}: {e}")
         prefix = str(label or "sec")
 
     max_view = min(len(rows or []), 200)
@@ -730,7 +767,8 @@ def _render_section(label, rows):
                             # Render the JSON in the left column so it's left-justified under the title
                             with c_left:
                                 st.json(job)
-                        except Exception:
+                        except Exception as e:
+                            print(f"[02_jobs_report] st.json render failed for job_id={jid}: {e}")
                             with c_left:
                                 st.write(job)
 

@@ -43,6 +43,22 @@ body {
 			margin: 0;
 			padding: 0;
 		}
+        /* Highlight styling (light mode) */
+        mark { background: #ffea70; color: #000; padding: 0 2px; border-radius: 2px; }
+        /* Dark mode */
+        @media (prefers-color-scheme: dark) {
+          mark { background: #777; color: #fff; }
+        }
+        /* Print */
+        @media print {
+          mark {
+            background: none !important;
+            color: inherit !important;
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+          }
+        }
+
 		.holder {
 			max-width: 1100px;
 			margin: 40px auto;
@@ -188,6 +204,7 @@ body {
 	</style>
 
 	<div class="holder">
+        <!--NOHL_START-->
 		<div class="sidebar">
 			<h1>{{ header.name }}</h1>
 			<div class="title">{{ header.title }}</div>
@@ -242,6 +259,7 @@ body {
 			{% endif %}
 		{% endfor %}
 		</div>
+        <!--NOHL_END-->
 		<div class="content">
 			<div class="content-section-title">Summary</div>
 			<div class="content-summary">{{ tailored_summary }}</div>
@@ -272,7 +290,14 @@ body {
 						{% if section.contributions %}
 							<ul class="job-contributions">
 								{% for contrib in section.contributions %}
-									<li>{{ contrib.description }}</li>
+									<li>{{ contrib.description }}
+										{% if contrib.skills_used and contrib.skills_used|length > 0 %}
+											<br /><small><strong>Skills:</strong> {{ contrib.skills_used | join(', ') }}</small>
+										{% endif %}
+										{% if contrib.impact %}
+											<br /><small><em>Impact{% if contrib.source %} — {{ contrib.source }}{% endif %}</em></small>
+										{% endif %}
+									</li>
 								{% endfor %}
 							</ul>
 						{% endif %}

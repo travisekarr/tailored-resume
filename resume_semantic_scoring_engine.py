@@ -50,9 +50,15 @@ def section_text(section):
     if isinstance(summary, str) and summary.strip():
         text_parts.append(summary.strip())
 
-    # Tags
-    tags = _safe_list(section.get("tags"))
-    text_parts.extend(str(t).strip() for t in tags if t)
+    # Tags (support dict with hard/soft)
+    tags_obj = section.get("tags")
+    tags_list = []
+    if isinstance(tags_obj, dict):
+        tags_list.extend([t for t in (tags_obj.get("hard") or []) if t])
+        tags_list.extend([t for t in (tags_obj.get("soft") or []) if t])
+    else:
+        tags_list = _safe_list(tags_obj)
+    text_parts.extend(str(t).strip() for t in tags_list if t)
 
     # Experience -> contributions + skills_used
     if section.get("type") == "experience":
@@ -148,13 +154,17 @@ def rank_by_embedding(resume, job_description, model="text-embedding-3-small"):
 # =====================
 def rank_resume_sections(resume, job_description):
     """Rank sections by keyword-based TF-IDF similarity."""
-    corpus = [job_description] + [section_text(sec) for sec in resume]
-    tfidf = TfidfVectorizer().fit_transform(corpus)
-    cosine_similarities = cosine_similarity(tfidf[0:1], tfidf[1:]).flatten()
-    ranked_indices = cosine_similarities.argsort()[::-1]
-    ranked_sections = [resume[i] for i in ranked_indices]
-    scores_dict = {id(resume[i]): float(cosine_similarities[i]) for i in range(len(resume))}
-    return ranked_sections, scores_dict
+    try:
+        corpus = [job_description] + [section_text(sec) for sec in resume]
+        tfidf = TfidfVectorizer().fit_transform(corpus)
+        cosine_similarities = cosine_similarity(tfidf[0:1], tfidf[1:]).flatten()
+        ranked_indices = cosine_similarities.argsort()[::-1]
+        ranked_sections = [resume[i] for i in ranked_indices]
+        scores_dict = {id(resume[i]): float(cosine_similarities[i]) for i in range(len(resume))}
+        return ranked_sections, scores_dict
+    except Exception as e:
+        print(f"Error in rank_resume_sections: {e}")
+        return resume, {}
 
 
 # =====================
@@ -166,14 +176,20 @@ def generate_tailored_resume(
     top_n=None,
     use_embeddings=False,
     ordering="relevancy",
-    embedding_model="text-embedding-3-small"
+    embedding_model="text-embedding-3-small",
+    role_filter=True,
 ):
     """
     Generate a tailored resume based on ordering preference.
     Returns: (list of sections, scores_dict)
     """
     if ordering == "chronological":
-        return [sec for sec in resume if sec["type"] != "header"], {}
+        out_sections = [sec for sec in resume if sec["type"] != "header"]
+        scores = {}
+        # Optionally filter contributions by relevancy role
+        if role_filter:
+            _apply_role_filter(out_sections, job_description)
+        return out_sections, scores
 
     if use_embeddings:
         ranked_sections, scores = rank_by_embedding(resume, job_description, model=embedding_model)
@@ -181,14 +197,86 @@ def generate_tailored_resume(
         ranked_sections, scores = rank_resume_sections(resume, job_description)
 
     if ordering == "relevancy":
-        return (ranked_sections[:top_n] if top_n else ranked_sections), scores
+        out_sections = (ranked_sections[:top_n] if top_n else ranked_sections)
+        if role_filter:
+            _apply_role_filter(out_sections, job_description)
+        return out_sections, scores
 
     if ordering == "hybrid":
         top_relevant = ranked_sections[:top_n]
         remaining = [sec for sec in resume if sec not in top_relevant and sec["type"] != "header"]
-        return top_relevant + remaining, scores
+        out_sections = top_relevant + remaining
+        if role_filter:
+            _apply_role_filter(out_sections, job_description)
+        return out_sections, scores
 
-    return resume, scores
+    out_sections = [sec for sec in resume if sec.get("type") != "header"]
+    if role_filter:
+        _apply_role_filter(out_sections, job_description)
+    return out_sections, scores
+
+
+# =====================
+# ROLE-BASED CONTRIBUTION FILTERING
+# =====================
+def _classify_role(job_description: str) -> str:
+    """Return 'developer', 'manager', or 'both' based on JD signals."""
+    if not isinstance(job_description, str) or not job_description.strip():
+        return "both"
+    text = job_description.lower()
+    # Token-like scan
+    import re as _re
+    tokens = _re.findall(r"[a-zA-Z0-9\-\./#]+", text)
+
+    mgr_terms = {
+        "manager","management","managing","people","direct reports","head","director","vp",
+        "leadership","stakeholder","stakeholders","roadmap","hiring","coaching","mentoring",
+        "performance","budget","budgets","program","portfolio","strategy","strategic",
+        "org","organizational","operational","operations","lead manager","engineering manager",
+        "sr manager","senior manager","team management","line manager","staffing",
+    }
+    dev_terms = {
+        "developer","engineer","software engineer","senior engineer","principal engineer",
+        "individual contributor","ic","hands-on","coding","programming","build","implement",
+        "api","microservices","architecture","architect","design","system design","sde","swe",
+    }
+    # Count hits (substring in tokens and raw text for multi-word phrases)
+    def count_terms(terms):
+        c = 0
+        for t in terms:
+            if " " in t:
+                if t in text:
+                    c += 2  # weight phrases higher
+            else:
+                c += sum(1 for tok in tokens if tok == t)
+        return c
+
+    mgr_score = count_terms(mgr_terms)
+    dev_score = count_terms(dev_terms)
+
+    # Heuristic thresholds
+    if mgr_score >= dev_score + 2:
+        return "manager"
+    if dev_score >= mgr_score + 2:
+        return "developer"
+    return "both"
+
+
+def _apply_role_filter(sections: list, job_description: str):
+    role = _classify_role(job_description)
+    if role == "both":
+        return
+    for sec in sections:
+        if sec.get("type") != "experience":
+            continue
+        contribs = sec.get("contributions") or []
+        def _ok(c):
+            rel = str((c or {}).get("relevancy", "both")).strip().lower()
+            return rel in ("both", role)
+        filtered = [c for c in contribs if _ok(c)]
+        if filtered:
+            sec["contributions"] = filtered
+        # If filtering drops all, keep originals to avoid empty sections
 
 
 # =====================
