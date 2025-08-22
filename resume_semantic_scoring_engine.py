@@ -1,6 +1,7 @@
 import yaml
 import os
 import json
+import re
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -340,3 +341,151 @@ Return only the bullet sentence, no leading dash.
     except Exception as e:
         print(f"Error enhancing experience with impact: {e}")
         return resume
+
+
+def generate_tailored_summary(
+    resume,
+    job_description,
+    use_gpt: bool = False,
+    model: str = "gpt-3.5-turbo",
+    use_embeddings: bool = False,
+    embedding_model: str = "text-embedding-3-small",
+) -> str:
+    """
+    Build a concise tailored summary string:
+      - Opening line from header title/years
+      - Top 3–4 matched skills (JD ∩ resume tags/skills)
+      - Notable achievement picked from resume (overlap or embeddings)
+      - Optional GPT paraphrase that preserves facts via placeholders
+    """
+    try:
+        header = next((sec for sec in resume if sec.get("type") == "header"), {}) or {}
+        title = header.get("title", "Experienced Professional")
+        years_exp = header.get("years_experience")
+        opening_line = f"{title} with {years_exp}+ years of proven expertise" if years_exp else f"{title} with proven expertise"
+
+        # Build JD keywords (simple tokens)
+        jd_tokens = {w.lower() for w in re.findall(r"[A-Za-z0-9+\-/#\.]{3,}", job_description or "")}
+
+        # Flatten resume tags/skills with common variants
+        def _flatten_tags(tags):
+            if isinstance(tags, dict):
+                vals = []
+                vals.extend(tags.get("hard", []) or [])
+                vals.extend(tags.get("soft", []) or [])
+                return [str(t).strip().lower() for t in vals if t]
+            elif isinstance(tags, list):
+                return [str(t).strip().lower() for t in tags if t]
+            return []
+
+        def _tag_variants(t: str) -> set[str]:
+            v = {t}
+            v.add(t.replace("_", "/")); v.add(t.replace("/", "_"))
+            v.add(t.replace("-", "_")); v.add(t.replace("_", "-"))
+            v.add(t.replace("_", " "))
+            v.add(t.replace(".", "")); v.add(t.replace(".", " "))
+            return {x for x in v if x}
+
+        all_resume_terms = set()
+        for section in resume or []:
+            tags = section.get("tags")
+            for t in _flatten_tags(tags):
+                all_resume_terms.update(_tag_variants(t))
+            if section.get("type") == "experience":
+                for c in (section.get("contributions") or []):
+                    for s in (c.get("skills_used") or []):
+                        all_resume_terms.update(_tag_variants(str(s).strip().lower()))
+
+        matched_skills = sorted(list(jd_tokens & all_resume_terms))
+        top_skills_str = ", ".join(matched_skills[:4]) if matched_skills else None
+
+        # Achievement: embeddings (if on) or overlap from resume_utils
+        try:
+            from resume_utils import pick_best_achievement_overlap as _ru_pick_best_achievement_overlap
+        except Exception:
+            _ru_pick_best_achievement_overlap = None
+
+        def _pick_best_achievement_embeddings() -> str | None:
+            try:
+                job_vec = get_embedding(job_description or "", model=embedding_model)
+                if not job_vec:
+                    return None
+                cands = []
+                for sec in resume or []:
+                    if sec.get("type") == "experience":
+                        for c in (sec.get("contributions") or []):
+                            d = (c or {}).get("description")
+                            if isinstance(d, str) and d.strip():
+                                cands.append(d.strip())
+                summ = next((sec for sec in resume or [] if sec.get("type") == "summary"), {})
+                for a in (summ.get("achievements") or []):
+                    if isinstance(a, str) and a.strip():
+                        cands.append(a.strip())
+                seen, uniq = set(), []
+                for c in cands:
+                    k = c.lower()
+                    if k not in seen:
+                        uniq.append(c); seen.add(k)
+                best, best_score = None, -1.0
+                for cand in uniq:
+                    vec = get_embedding(cand, model=embedding_model)
+                    if not vec:
+                        continue
+                    score = cosine_similarity([job_vec], [vec])[0][0]
+                    if score > best_score:
+                        best, best_score = cand, float(score)
+                return best
+            except Exception:
+                return None
+
+        achievement = None
+        if use_embeddings:
+            achievement = _pick_best_achievement_embeddings()
+        if not achievement and callable(_ru_pick_best_achievement_overlap):
+            achievement = _ru_pick_best_achievement_overlap(resume, job_description)
+
+        parts = [opening_line]
+        if top_skills_str:
+            parts.append(f"specializing in {top_skills_str}")
+        if achievement:
+            parts.append(f"Notable achievement: {achievement}")
+        offline = ". ".join(parts) + "."
+        if not use_gpt:
+            return offline
+
+        # Placeholder-protected paraphrase
+        outline = []
+        outline.append("[TITLE] with [YEARS]+ years of proven expertise" if years_exp else "[TITLE] with proven expertise")
+        if top_skills_str:
+            outline.append("specializing in [SKILLS]")
+        if achievement:
+            outline.append("Notable achievement: [ACHIEVEMENT]")
+        outline_text = ". ".join(outline) + "."
+        try:
+            from openai_utils import chat_completion
+            sys = "You rewrite text concisely without adding facts. Preserve placeholders exactly."
+            prompt = (
+                "Rewrite the following into a polished 2–4 sentence professional summary (<=300 characters),\n"
+                "keeping the placeholders [TITLE], [YEARS], [SKILLS], and [ACHIEVEMENT] EXACTLY AS WRITTEN.\n"
+                "Do NOT introduce any new facts, numbers, or achievements.\n\n"
+                f"Outline:\n{outline_text}"
+            )
+            msg = [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": prompt},
+            ]
+            text, _resp = chat_completion(msg, model=model, max_tokens=180, temperature=0.2, context="sem_engine:tailored_summary")
+            templated = (text or outline_text).strip()
+            subs = {
+                "[TITLE]": title,
+                "[YEARS]": str(years_exp) if years_exp is not None else "",
+                "[SKILLS]": top_skills_str or "",
+                "[ACHIEVEMENT]": achievement or "",
+            }
+            for k, v in subs.items():
+                templated = templated.replace(k, v)
+            return re.sub(r"\s{2,}", " ", templated).strip(" .") + "."
+        except Exception:
+            return offline
+    except Exception:
+        return ""

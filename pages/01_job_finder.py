@@ -1,23 +1,4 @@
 _openai_client = None
-import dateutil.parser
-def format_dt(val):
-    if not val:
-        return ""
-    try:
-        # Handle integer/float timestamps
-        if isinstance(val, (int, float)) or (isinstance(val, str) and val.strip().isdigit()):
-            dt = datetime.fromtimestamp(float(val), tz=pytz.UTC)
-        else:
-            # Try parsing RFC2822, ISO, etc.
-            dt = dateutil.parser.parse(str(val))
-            if not dt.tzinfo:
-                dt = dt.replace(tzinfo=pytz.UTC)
-        tz = pytz.timezone(TZ)
-        dt = dt.astimezone(tz)
-        return dt.strftime(DT_FMT)
-    except Exception:
-        return str(val)
-# pages/01_job_finder.py
 import os
 import json
 import streamlit as st
@@ -484,32 +465,34 @@ if run:
 
             rows = []
             for i, h in enumerate(history):
+                # Pull inserted/updated only (do NOT use ambiguous 'new' key)
                 ins = _get_nested(h, "inserted")
                 upd = _get_nested(h, "updated")
-                # Accept some alternate keys just in case
-                if ins in (None, ""):
-                    ins = _get_nested(h, "new")
-                if ins in (None, ""):
-                    ins = 0
+                # Also accept some alternate update keys if present
                 if upd in (None, ""):
-                    upd = 0
+                    upd = _get_nested(h, "updated_count")
                 ins = _to_int(ins, 0)
                 upd = _to_int(upd, 0)
-                # If inserted missing/zero, use fallback based on Jobs Total delta
+
+                # Fallback for inserted using Jobs Total delta when missing
                 if ins == 0 and fallback_new[i] > 0:
                     ins = fallback_new[i]
+
+                # Final prefers inserted+updated; otherwise use pipeline final_count
+                pipeline_final = _to_int(_get_nested(h, "final_count") or h.get("final_count") or 0)
+                final_eff = (ins + upd) if (ins > 0 or upd > 0) else pipeline_final
 
                 rows.append({
                     "Pulled At": _fmt_dt(h.get("pulled_at") or h.get("created_at")),
                     "Embeddings": (f"Yes ({h.get('embedding_model')})" if h.get("use_embeddings") else "No"),
                     "Ordering": h.get("ordering") or "",
-                    "New": ins,                         # <-- NEW
-                    "Updated": upd,                     # <-- NEW
+                    "New": ins,
+                    "Updated": upd,
                     "Raw": _to_int(_get_nested(h, "raw_total") or h.get("raw_total") or 0),
                     "After Remote": _to_int(_get_nested(h, "after_remote") or h.get("after_remote") or 0),
                     "After Filter": _to_int(_get_nested(h, "after_filter") or h.get("after_filter") or 0),
                     "After Dedupe": _to_int(_get_nested(h, "after_dedupe") or h.get("after_dedupe") or 0),
-                    "Final": _to_int(_get_nested(h, "final_count") or h.get("final_count") or 0),
+                    "Final": final_eff,
                     "Jobs Total": jobs_totals[i],
                 })
 
